@@ -693,6 +693,38 @@ class PPOTrainer:
                 resource_pool=teacher_resource_pool,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            # OPD trick (revisiting_opd §4.3): auto-encode special-token strings to ids
+            # using the trainer tokenizer, unless the user already supplied ids.
+            try:
+                _opd_loss_cfg = self.distillation_config.distillation_loss
+                if (
+                    getattr(_opd_loss_cfg, "opd_mask_special_tokens", False)
+                    and not list(_opd_loss_cfg.opd_mask_token_ids)
+                    and list(_opd_loss_cfg.opd_mask_first_tokens)
+                ):
+                    from verl.utils.distillation.special_token_mask import encode_special_token_ids
+
+                    ids = encode_special_token_ids(self.tokenizer, _opd_loss_cfg.opd_mask_first_tokens)
+                    _opd_loss_cfg.opd_mask_token_ids = ids
+                    logger.info(
+                        "[OPD] opd_mask_special_tokens=True; encoded "
+                        f"{_opd_loss_cfg.opd_mask_first_tokens} -> token_ids={ids}"
+                    )
+                # OPSD shares student/teacher vocab, so first-occurrence special-token
+                # masking has no semantic motivation there (it would just drop one
+                # valid response token per row).
+                if (
+                    getattr(_opd_loss_cfg, "opd_mask_special_tokens", False)
+                    and getattr(self.distillation_config, "self_distill", None) is not None
+                    and getattr(self.distillation_config.self_distill, "enabled", False)
+                ):
+                    logger.warning(
+                        "[OPSD] opd_mask_special_tokens=True is ignored-by-design for OPSD: "
+                        "student and ref share the same tokenizer/vocab, so chat-template drift "
+                        "cannot occur. Set it to False to suppress this warning."
+                    )
+            except Exception as _e:  # pragma: no cover - best-effort
+                logger.warning(f"[OPD] auto-encoding opd_mask_first_tokens failed: {_e}")
         else:
             self.teacher_model_manager = None
             self.distillation_config = None

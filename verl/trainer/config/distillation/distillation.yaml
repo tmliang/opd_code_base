@@ -13,6 +13,12 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Distillation mode:
+#   - "external" (default): verl OPD with a separate teacher Ray cluster (vLLM/SGLang).
+#   - "self"             : OPSD. Teacher colocated with the actor; only the prompt
+#                          differs from the student. Reuses the OPD loss kernel.
+mode: external
+
 # distillation loss config
 distillation_loss:
 
@@ -53,6 +59,35 @@ distillation_loss:
 
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
+
+  # Which family of distillation kernels to use:
+  #   "verl" (default) -> existing dispatch via loss_mode above
+  #                       (k1 / k3 / abs / mse / low_var_kl / kl / forward_kl_topk).
+  #   "sdpo"           -> SDPO alpha-parameterised KL. loss_mode is overridden
+  #                       automatically to sdpo_alpha_kl_topk (or _sampled when
+  #                       sdpo.mode==sampled); the verl loss_mode field is ignored.
+  kl_family: verl
+
+  # SDPO alpha-KL hyperparameters. Consulted only when kl_family == "sdpo".
+  sdpo:
+    _target_: verl.workers.config.SDPODistillationLossConfig
+    # alpha == 0   -> forward KL  (KL(teacher || student))
+    # alpha == 0.5 -> Jensen-Shannon divergence
+    # alpha == 1   -> reverse KL  (KL(student || teacher))   ← only mode that works in "sampled" mode
+    # alpha in (0,1)\{0.5} -> skew / generalised JSD
+    alpha: 1.0
+    # "topk":    consumes teacher top-k logprobs+ids in batch (OPD external teacher; OPSD blocked until top-k extraction lands)
+    # "full":    full-vocab teacher logprobs (not yet wired)
+    # "sampled": sampled-token logprob path; alpha must be 1.0
+    mode: topk
+    # How to handle the residual mass outside the top-K when mode==topk.
+    #   "add"    : append a virtual K+1 bucket carrying log(1 - Σ p_i) (SDPO default)
+    #   "renorm" : re-normalise both top-K distributions to sum to 1
+    #   "drop"   : use raw top-K log-probs unchanged
+    tail: add
+    # Optional per-token PPO ratio clip applied to the distillation loss:
+    # multiply each token by min(exp(student_lp - old_lp), ratio_clip). null disables.
+    ratio_clip: null
 
 
 # Number of GPUs per node in the distillation teacher resource pool
@@ -111,3 +146,32 @@ teacher_models:
 
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
+# OPSD-only settings. Consulted only when distillation.mode == "self".
+self_distill:
+  _target_: verl.workers.config.SelfDistillationConfig
+
+  # How the teacher policy is obtained from the student.
+  #   "ref":          frozen reference policy (vanilla on-policy distillation).
+  #   "ema":          ref <- ema_decay * ref + (1 - ema_decay) * actor   (every step, default).
+  #   "progressive":  ref <- actor  every teacher_update_interval steps.
+  #   "trust_region": ref <- actor  whenever measured student/teacher KL <= trust_region_threshold.
+  teacher_update: ema
+  ema_decay: 0.999
+  teacher_update_rate: 0.0          # legacy alias; if > 0, overrides ema_decay as (1 - teacher_update_rate)
+  teacher_update_interval: 0        # required (> 0) for "progressive" mode
+  trust_region_threshold: 0.0       # required (>= 0) for "trust_region" mode
+
+  # Truncation strategy when teacher prompt exceeds data.max_prompt_length.
+  truncation: right
+
+  # Importable FQN of the user's teacher dataloader class. Subclass either
+  #   verl.workers.self_distillation.OfflineTeacherDataloader
+  # or
+  #   verl.workers.self_distillation.OnlineTeacherDataloader
+  # The framework auto-detects offline vs online via isinstance.
+  # e.g. "my_pkg.my_module:MyTeacherDataloader"
+  dataloader: null
+
+  # Forwarded as **kwargs to the dataloader's __init__. tokenizer/processor
+  # are injected by the framework.
+  dataloader_kwargs: {}

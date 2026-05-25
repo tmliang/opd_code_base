@@ -1,307 +1,247 @@
-<div align="center">
- 👋 Hi, everyone!
-    verl is a RL training library initiated by <b>ByteDance Seed team</b> and maintained by the verl community.
-    <br>
-    <br>
-</div>
+# OPSD：On-Policy Self-Distillation
 
-<div align="center">
+本目录收录了 OPSD（On-Policy Self-Distillation）相关的可直接运行配方：
 
-<a href="https://deepwiki.com/verl-project/verl"><img src="https://devin.ai/assets/deepwiki-badge.png" alt="Ask DeepWiki.com" style="height:20px;"></a>
-[![GitHub Repo stars](https://img.shields.io/github/stars/verl-project/verl)](https://github.com/verl-project/verl/stargazers)
-[![Twitter](https://img.shields.io/twitter/follow/verl_project)](https://twitter.com/verl_project)
-<a href="https://join.slack.com/t/verl-project/shared_invite/zt-3c6mc2khw-v0lo6NfDPuFP6OnkrZwfqw"><img src="https://img.shields.io/badge/Slack-verl-blueviolet?logo=slack&amp"></a>
-<a href="https://arxiv.org/pdf/2409.19256"><img src="https://img.shields.io/static/v1?label=EuroSys&message=Paper&color=red"></a>
-[![Documentation](https://img.shields.io/badge/documentation-blue)](https://verl.readthedocs.io/en/latest/)
-<a href="https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG"><img src="https://img.shields.io/badge/微信-green?logo=wechat&amp"></a>
+- [`run_qwen_opsd.sh`](./run_qwen_opsd.sh)：原始 OPSD 论文复现
+- [`run_qwen_sdpo.sh`](./run_qwen_sdpo.sh)：SDPO（EMA teacher + alpha-KL）
+- [`run_qwen_vision_opd.sh`](./run_qwen_vision_opd.sh)：Vision-OPD（多模态图像 prompt 改写）
+- [`teacher_dataloader/`](./teacher_dataloader/)：上述三个配方对应的 teacher dataloader 实现
+- [`vision_opd_reward.py`](./vision_opd_reward.py)：Vision-OPD 用的 V\*Bench multi-choice reward function
 
-</div>
+OPSD 让 student **以自身为教师**进行 on-policy 蒸馏——不需要额外的教师模型、不需要额外的显存。教师信号通过**重写 prompt**（注入 gold answer、加 few-shot 示范、加 hint 等）从同一个模型激发出来。
 
-![seed logo](https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216)
+> 适用条件：没有更强的教师模型，但你能写出"如果给模型多一点信息，它能答得更好"的 prompt 改写规则。
 
-<h1 style="text-align: center;">verl: Volcano Engine Reinforcement Learning for LLMs</h1>
+## 环境安装
+参考 `install_for_cuda128.sh` 和 `install_for_cuda130.sh`
 
-verl is a flexible, efficient and production-ready RL training library for large language models (LLMs).
+---
 
-verl is the open-source version of **[HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)** paper.
+## 1. 快速上手
 
-verl is flexible and easy to use with:
+### Step 1：写一个 teacher dataloader
 
-- **Easy extension of diverse RL algorithms**: The hybrid-controller programming model enables flexible representation and efficient execution of complex post-training dataflows. Build RL dataflows such as GRPO, PPO in a few lines of code.
+继承 `OfflineTeacherDataloader`（无需 rollout 信息）或 `OnlineTeacherDataloader`（需要访问 student rollout），实现 `build_one` 返回 `TeacherSample`：
 
-- **Seamless integration of existing LLM infra with modular APIs**: Decouples computation and data dependencies, enabling seamless integration with existing LLM frameworks, such as FSDP, Megatron-LM, vLLM, SGLang, etc
+#### 示例 1：Offline —— 把 gold answer 拼进 prompt template
 
-- **Flexible device mapping**: Supports various placement of models onto different sets of GPUs for efficient resource utilization and scalability across different cluster sizes.
+```python
+# my_pkg/opsd.py
+import copy
+from verl.workers.self_distillation import OfflineTeacherDataloader, TeacherSample
 
-- Ready integration with popular HuggingFace models
 
-verl is fast with:
+class GoldAnswerTeacher(OfflineTeacherDataloader):
+    """把 gold answer 嵌入用户消息末尾，引导 ref policy 生成更对齐的 logprob。"""
 
-- **State-of-the-art throughput**: SOTA LLM training and inference engine integrations and SOTA RL throughput.
+    HINT_SUFFIX = "\n\n(Hint: the final answer is {answer}. Show your reasoning step by step.)"
 
-- **Efficient actor model resharding with 3D-HybridEngine**: Eliminates memory redundancy and significantly reduces communication overhead during transitions between training and generation phases.
+    def build_one(self, *, prompt_messages, prompt_text, multi_modal_data, extra_info):
+        answer = extra_info.get("answer")
+        if answer is None or prompt_messages is None:
+            return TeacherSample(messages=[], skip=True)
 
-<div align="center">
- <img src="https://github.com/verl-project/verl-data/blob/main/images/verl-arch.png?raw=true" width="400" alt="verl-arch.png">
-</div>
-
-</p>
-
-## News
-- [2026/05] [VeRL-Omni](https://github.com/verl-project/verl-omni) is pre-released: a unified RL stack for diffusion and omni-modal model post-training built on top of verl. Read the [blog post](https://vllm.ai/blog/2026-05-14-verl-omni) for details.
-- [2026/05] verl's zero-mismatch HuggingFace rollout [vexact](https://github.com/verl-project/vexact) is released: with batch-invariant kernels, shared model definition with FSDP, and out-of-box examples compatible with VeOmni.
-- [2026/04] verl's Megatron backend LoRA and router replay support is showcased at [PyTorch Conference Europe 2026](https://pytorchconferenceeu2026.sched.com/event/2Juce/optimizing-reinforcement-learning-at-trillion-parameter-scale-songlin-jiang-aalto-university-mind-lab).
-- [2026/03] verl is presented at NVIDIA GTC26: [session#1](https://www.nvidia.com/en-us/on-demand/session/gtc26-S81829/), [session#2](https://www.nvidia.com/en-us/on-demand/session/gtc26-S81620/)
-- [2026/01] verl has been migrated to the [verl-project](https://github.com/verl-project)
-- [2026/01] verl first meetup was successfully held in Shanghai on 01/10, hosted by Volcengine and NVIDIA, the slides has been uploaded to [verl-data](https://github.com/verl-project/verl-data).
-- [2026/01] The `recipe` directory has been migrated to a dedicated repository: [verl-recipe](https://github.com/verl-project/verl-recipe) and added as a submodule. See https://github.com/verl-project/verl/pull/4795. It can be used as it was after `git submodule update --init --recursive recipe`. Note that [`transfer_queue`](verl/experimental/transfer_queue), [`fully_async_policy`](verl/experimental/fully_async_policy), [`one_step_off_policy`](verl/experimental/one_step_off_policy) and [`vla`](verl/experimental/vla) are kept under [`verl/experimental`](verl/experimental) since they are planned to be merged into the main library. Use them through `verl.experimental.{module}`.
-- [2025/12] [Mind Lab](https://macaron.im/mindlab) successfully used [verl](https://github.com/verl-project/verl) and [Megatron-bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) to train GRPO Lora for Trillion-parameter model on 64 H800 - See their [techblog](https://macaron.im/mindlab/research/building-trillion-parameter-reasoning-rl-with-10-gpus).
-- [2025/10] verl is presented in the [PyTorch Conference 2025](https://pytorch.org/event/pytorch-conference-2025/).
-- [2025/08] verl is presented in the [PyTorch Expert Exchange Webinar](https://www.youtube.com/watch?v=Vd79NmmqY3Q&t=2s). [Slides](https://github.com/eric-haibin-lin/verl-community/blob/main/slides/verl_talk_pytorch_2025_08.pdf) available.
-- [2025/07] The [ReTool](https://arxiv.org/pdf/2504.11536) recipe is fully open sourced. [Blog](https://www.notion.so/verl-reTool-recipe-Using-multi-round-conversations-and-code-sandboxing-to-improve-the-math-of-large-23a8b5b7feba80b386b2e5b5e3c1cde0)
-- [2025/07] The first verl meetup will be held at ICML Vancouver on July 16th! Please [join us](https://lu.ma/0ek2nyao) if you are at ICML! (onsite only)
-- [2025/06] verl with Megatron backend enables large MoE models such as [DeepSeek-671B and Qwen3-235B](https://verl.readthedocs.io/en/latest/perf/dpsk.html).
-- [2025/03] [DAPO](https://dapo-sia.github.io/) is the open-sourced SOTA RL algorithm that achieves 50 points on AIME 2024 based on the Qwen2.5-32B pre-trained model, surpassing the previous SOTA achieved by DeepSeek's GRPO (DeepSeek-R1-Zero-Qwen-32B). DAPO's training is fully powered by verl and the reproduction code is available in `recipe/dapo` now.
-<details><summary> more... </summary>
-<ul>
-  <li>[2025/04] [Seed-Thinking-v1.5](https://github.com/ByteDance-Seed/Seed-Thinking-v1.5/blob/main/seed-thinking-v1.5.pdf) tech report is released! Trained with verl, Seed-Thinking-v1.5 achieves 86.7 on AIME 2024, 55.0 on Codeforces and 77.3 on GPQA, demonstrating excellent reasoning abilities in STEM and coding. Beyond reasoning tasks, the method demonstrates notable generalization across diverse domains.</li>
-  <li>[2025/07] verl keynote at [AWS AI Hours Singapore](https://pages.awscloud.com/aws-ai-hours-sg.html#agenda) on 7/8, verl & verl-agent project updates at [Agent for SWE meetup](https://lu.ma/e498qhsi) by LF AI & Data Singapore on 7/11.</li>
-  <li>[2025/06] verl team will provide latest project updates at [PyTorch Day China](https://www.lfasiallc.com/pytorch-day-china/) on June 7th. Meet our dev team in Beijing!</li>
-  <li> [2025/04] [VAPO](https://arxiv.org/pdf/2504.05118) (value-based augmented PPO) paper covers our latest RL method for reasoning models. Trained from Qwen-32B-base model, VAPO achieves 60.4 on AIME 2024, outperforming DAPO-32B.</li>
-  <li>[2025/05] [PF-PPO](https://arxiv.org/abs/2409.06957), accepted to ICML 2025, is now supported in verl! PF-PPO enhances policy learning efficiency and robustness by filtering potentially noisy reward signals and reusing high-quality experiences via a replay buffer.</li>
-  <li>[2025/04] We will give a tutorial about latest post-training techniques and programming guide for verl at [ICLR 2025 Expo](https://iclr.cc/virtual/2025/calendar?filter_events=Expo+Talk+Panel&filter_rooms=), [SCI-FM workshop](https://open-foundation-model.github.io/) and [LMSys afterparty](https://lu.ma/d23nyynm). Talk materials available [here](https://github.com/eric-haibin-lin/verl-community/tree/main/iclr25). </li>
-  <li>[2025/03] verl v0.3.0.post1 is released! See [release note](https://github.com/verl-project/verl/releases/) for details. It achieves [~1.4x speedup](https://tongyx361.github.io/blogs/posts/verl-intro/#/verl-flexible-and-efficient-rl-for-llms) compared to prev versions.</li>
-  <li>[2025/05] verl will be presented at [A2M Shanghai](https://a2m.msup.com.cn/home/?aid=4488&city=shanghai) on 5/16 - 5/17.</li>
-  <li>[2025/05] verl will be presented at [GOSIM x PyTorch Day 2025](https://paris2025.gosim.org/). See you in Paris! </li>
-  <li>[2025/03] We introduced the programming model of verl at the [vLLM Beijing Meetup](https://mp.weixin.qq.com/s/n77GibL2corAtQHtVEAzfg) and [verl intro and updates](https://github.com/eric-haibin-lin/verl-community/blob/main/slides/verl-lmsys-meetup.pdf) at the [SGLang-LMSYS Org Meetup](https://lu.ma/ntjrr7ig) in Sunnyvale mid-March.</li>
-  <li>[2025/03] We will present verl(HybridFlow) at EuroSys 2025. See you in Rotterdam!</li>
-  <li>[2025/02] verl v0.2.0.post2 is released!</li>
-  <li>[2025/02] We presented verl in the <a href="https://lu.ma/ji7atxux">Bytedance/NVIDIA/Anyscale Ray Meetup</a>. See you in San Jose!</li>
-  <li>[2025/01] [Doubao-1.5-pro](https://team.doubao.com/zh/special/doubao_1_5_pro) is released with SOTA-level performance on LLM & VLM. The RL scaling preview model is trained using verl, reaching OpenAI O1-level performance on math benchmarks (70.0 pass@1 on AIME).</li>
-  <li>[2024/12] verl is presented at Ray Forward 2024. Slides available <a href="https://github.com/eric-haibin-lin/verl-community/blob/main/slides/Ray_Forward_2024_%E5%B7%AB%E9%94%A1%E6%96%8C.pdf">here</a></li>
-  <li>[2024/12] The team presented <a href="https://neurips.cc/Expo/Conferences/2024/workshop/100677">Post-training LLMs: From Algorithms to Infrastructure</a> at NeurIPS 2024. <a href="https://github.com/eric-haibin-lin/verl-data/tree/neurips">Slides</a> and <a href="https://neurips.cc/Expo/Conferences/2024/workshop/100677">video</a> available.</li>
-  <li>[2024/10] verl is presented at Ray Summit. <a href="https://www.youtube.com/watch?v=MrhMcXkXvJU&list=PLzTswPQNepXntmT8jr9WaNfqQ60QwW7-U&index=37">Youtube video</a> available.</li>
-  <li>[2024/08] HybridFlow (verl) is accepted to EuroSys 2025.</li>
-</ul>
-</details>
-
-## Key Features
-
-- **FSDP**, **FSDP2** and **Megatron-LM** for training.
-- **vLLM**, **SGLang** and **HF Transformers** for rollout generation.
-- Compatible with Hugging Face Transformers and Modelscope Hub: Qwen3.5, Qwen3, Qwen-2.5, Llama3.1, Gemma2, DeepSeek-LLM, etc
-- Supervised fine-tuning.
-- Reinforcement learning with [PPO](examples/ppo_trainer/), [GRPO](examples/grpo_trainer/), [GSPO](https://github.com/verl-project/verl-recipe/tree/main/gspo/), [ReMax](examples/remax_trainer/), [REINFORCE++](https://verl.readthedocs.io/en/latest/examples/config.html#algorithm), [RLOO](examples/rloo_trainer/), [PRIME](https://github.com/verl-project/verl-recipe/tree/main/prime/), [DAPO](https://github.com/verl-project/verl-recipe/tree/main/dapo/), [DrGRPO](https://github.com/verl-project/verl-recipe/tree/main/drgrpo), [KL_Cov & Clip_Cov](https://github.com/verl-project/verl-recipe/tree/main/entropy) etc.
-  - Support model-based reward and function-based reward (verifiable reward) for math, [coding](https://github.com/verl-project/verl-recipe/tree/main/dapo), etc
-  - Support vision-language models (VLMs) and [multi-modal RL](examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh) with Qwen2.5-vl, Kimi-VL
-  - [Multi-turn with tool calling](examples/tutorial/agent_loop_get_started/)
-- LLM alignment recipes such as [Self-play preference optimization (SPPO)](https://github.com/verl-project/verl-recipe/tree/main/sppo)
-- Flash attention 2, sequence packing, sequence parallelism via DeepSpeed Ulysses, [LoRA](examples/tuning/lora/run_qwen3_8b_fsdp.sh), [Liger-kernel](examples/sft/gsm8k/run_qwen2_5_0_5b_fsdp.sh) (`USE_LIGER=1`).
-- Scales up to 671B models and hundreds of GPUs with [expert parallelism](https://github.com/verl-project/verl/pull/1467)
-- Multi-gpu [LoRA RL](https://verl.readthedocs.io/en/latest/advance/ppo_lora.html) support to save memory.
-- Experiment tracking with wandb, swanlab, mlflow and tensorboard.
-- Hardware Support: Supports NVIDIA, AMD, [Ascend](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/quick_start/ascend_quick_start.rst)
-
-## Getting Started
-
-<a href="https://verl.readthedocs.io/en/latest/index.html"><b>Documentation</b></a>
-
-**Quickstart:**
-
-- [Installation](https://verl.readthedocs.io/en/latest/start/install.html)
-- [Quickstart](https://verl.readthedocs.io/en/latest/start/quickstart.html)
-- [Programming Guide](https://verl.readthedocs.io/en/latest/hybrid_flow.html) & [Tech Talk](https://hcqnc.xetlk.com/sl/3vACOK) (in Chinese)
-- [PPO in verl](https://verl.readthedocs.io/en/latest/algo/ppo.html)
-- [GRPO in verl](https://verl.readthedocs.io/en/latest/algo/grpo.html)
-
-**Running a PPO example step-by-step:**
-
-- [Prepare Data for Post-Training](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html)
-- [Implement Reward Function for Dataset](https://verl.readthedocs.io/en/latest/preparation/reward_function.html)
-- [PPO Example Architecture](https://verl.readthedocs.io/en/latest/examples/ppo_code_architecture.html)
-- [Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
-
-**Reproducible algorithm baselines:**
-
-- [RL performance on coding, math](https://verl.readthedocs.io/en/latest/algo/baseline.html)
-
-**Algorithm recipes (`recipe/`):**
-
-- Optional workflows and baselines live under [`recipe/`](recipe/). Each recipe subdirectory includes a small **`REQUIRED_VERL.txt`** file describing the intended `verl` install: pinned recipes use a **tag or fixed git SHA**; rolling recipes record an explicit **`VERL_COMMIT`** (and related submodule / recipe-folder SHAs) so you can `pip install verl@git+…@<sha>` without guessing. See [`recipe/README.md`](recipe/README.md) for the full index and links.
-
-**For code explanation and advance usage (extension):**
-
-- PPO Trainer and Workers
-
-  - [PPO Ray Trainer](https://verl.readthedocs.io/en/latest/workers/ray_trainer.html)
-  - [Model Engine](https://verl.readthedocs.io/en/latest/workers/model_engine.html)
-  - [Engine Workers (FSDP / Megatron-LM / Automodel / VeOmni / TorchTitan)](https://verl.readthedocs.io/en/latest/workers/engine_workers.html)
-
-- Advanced Usage and Extension
-  - [Add Models with the FSDP Backend](https://verl.readthedocs.io/en/latest/advance/fsdp_extension.html)
-  - [Add Models with the Megatron-LM Backend](https://verl.readthedocs.io/en/latest/advance/megatron_extension.html)
-  - [Multi-turn Rollout Support](https://verl.readthedocs.io/en/latest/sglang_multiturn/multiturn.html)
-  - [Search Tool Integration](https://verl.readthedocs.io/en/latest/sglang_multiturn/search_tool_example.html)
-  - [Sandbox Fusion Integration](https://verl.readthedocs.io/en/latest/examples/sandbox_fusion_example.html)
-  - [Extend to Other RL(HF) algorithms](https://verl.readthedocs.io/en/latest/advance/dpo_extension.html)
-  - [Ray API design tutorial](https://verl.readthedocs.io/en/latest/advance/placement.html)
-
-**Blogs from the community**
-
-- [When Reasoning Models Break Tokenization: The Hidden Complexity of Multiturn Training](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/fast_tokenization/multiturn_tokenization_and_masking.md)
-- [verl deployment on AWS SageMaker](https://medium.com/@kaige.yang0110/run-verl-on-sagemaker-using-4x8-l40s-gpus-8e6d5c3c61d3)
-- [verl x SGLang Multi-turn Code Walkthrough](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/code-walk-through/readme_EN.md)
-- [Optimizing SGLang Memory Usage in verl](https://hebiao064.github.io/rl-memory-management)
-- [SGLang, verl, OpenBMB and Tsinghua University: Pioneering End-to-End Multi-Turn RLHF](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/verl-multiturn-rollout-Release.md)
-- [Reinforcement Learning from Human Feedback on AMD GPUs with verl and ROCm Integration](https://rocm.blogs.amd.com/artificial-intelligence/verl-large-scale/README.html)
-- [veMLP x verl ：玩转强化学习训练](https://mp.weixin.qq.com/s/7nbqxk4knMGd-hQE9ls2tA)
-- [使用 verl 进行 GRPO 分布式强化学习训练最佳实践](https://www.volcengine.com/docs/6459/1463942)
-- [HybridFlow verl 原文浅析](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/readme.md)
-- [最高提升 20 倍吞吐量！豆包大模型团队发布全新 RLHF 框架，现已开源！](https://team.doubao.com/en/blog/%E6%9C%80%E9%AB%98%E6%8F%90%E5%8D%8720%E5%80%8D%E5%90%9E%E5%90%90%E9%87%8F-%E8%B1%86%E5%8C%85%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%9B%A2%E9%98%9F%E5%8F%91%E5%B8%83%E5%85%A8%E6%96%B0-rlhf-%E6%A1%86%E6%9E%B6-%E7%8E%B0%E5%B7%B2%E5%BC%80%E6%BA%90)
-
-## Performance Tuning Guide
-
-The performance is essential for on-policy RL algorithm. We have written a detailed [performance tuning guide](https://verl.readthedocs.io/en/latest/perf/perf_tuning.html) to help you optimize performance.
-
-## Upgrade to vLLM >= v0.8.2
-
-verl now supports vLLM>=0.8.2 when using FSDP as the training backend. Please refer to [this document](https://github.com/verl-project/verl/blob/main/docs/README_vllm0.8.md) for the installation guide and more information. Please avoid vllm 0.7.x, which contains bugs that may lead to OOMs and unexpected errors.
-
-## Use Latest SGLang
-
-SGLang is fully supported with verl, and SGLang RL Group is working extensively on building unique features, including multi-turn agentic RL, VLM RLHF, server-based RL, and partial rollout. Please refer to [this document](https://verl.readthedocs.io/en/latest/workers/sglang_worker.html) for the installation guide and more information.
-
-## Upgrade to FSDP2
-
-verl is fully embracing FSDP2! FSDP2 is recommended by torch distributed team, providing better throughput and memory usage, and is composible with other features (e.g. torch.compile). To enable FSDP2, simply use verl main and set the following options:
-
-```
-actor_rollout_ref.ref.strategy=fsdp2
-actor_rollout_ref.actor.strategy=fsdp2
-critic.strategy=fsdp2
+        messages = copy.deepcopy(prompt_messages)
+        # 在最后一条 user 消息末尾追加 hint
+        for msg in reversed(messages):
+            if msg["role"] == "user":
+                msg["content"] += self.HINT_SUFFIX.format(answer=answer)
+                break
+        return TeacherSample(messages=messages, multi_modal_data=multi_modal_data)
 ```
 
-Furthermore, FSDP2 cpu offloading is compatible with gradient accumulation. You can turn it on to save memory with `actor_rollout_ref.actor.fsdp_config.offload_policy=True`. For more details, see https://github.com/verl-project/verl/pull/1026
+#### 示例 2：Online —— 用同 prompt 下最优兄弟 response 当 few-shot
 
-## AMD Support (ROCm Kernel)
+```python
+# my_pkg/opsd.py
+import copy
+from verl.workers.self_distillation import OnlineTeacherDataloader, TeacherSample
 
-verl now supports FSDP as the training engine (Megatron support coming soon) and both integrates with vLLM and SGLang as inference engines. Please refer to [this document](https://github.com/verl-project/verl/blob/main/docs/amd_tutorial/amd_build_dockerfile_page.rst) for the installation guide and more information, and [this document](https://github.com/verl-project/verl/blob/main/docs/amd_tutorial/amd_vllm_page.rst) for the vLLM performance tuning for ROCm.
 
-## Citation and acknowledgement
+class BestSiblingTeacher(OnlineTeacherDataloader):
+    """用同一 prompt 下奖励最高的兄弟 response 当 few-shot 示范（需 rollout.n > 1）。"""
 
-If you find the project helpful, please cite:
+    def build_one(self, *, prompt_messages, prompt_text, response_text,
+                  reward, multi_modal_data, extra_info, batch_view, index):
+        if prompt_messages is None:
+            return TeacherSample(messages=[], skip=True)
 
-- [HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)
-- [A Framework for Training Large Language Models for Code Generation via Proximal Policy Optimization](https://i.cs.hku.hk/~cwu/papers/gmsheng-NL2Code24.pdf)
+        best_j, best_r = index, reward if reward is not None else -float("inf")
+        for j in batch_view.iter_same_uid(index):
+            rj = batch_view.rewards[j] if batch_view.rewards else None
+            if rj is not None and rj > best_r:
+                best_j, best_r = j, rj
+        if best_j == index:
+            return TeacherSample(messages=[], skip=True)
 
-```bibtex
-@article{sheng2024hybridflow,
-  title   = {HybridFlow: A Flexible and Efficient RLHF Framework},
-  author  = {Guangming Sheng and Chi Zhang and Zilingfeng Ye and Xibin Wu and Wang Zhang and Ru Zhang and Yanghua Peng and Haibin Lin and Chuan Wu},
-  year    = {2024},
-  journal = {arXiv preprint arXiv: 2409.19256}
-}
+        demo = batch_view.response_texts[best_j]
+        messages = [
+            *copy.deepcopy(prompt_messages),
+            {"role": "assistant", "content": demo},
+            {"role": "user", "content": "Now answer the same question:"},
+        ]
+        return TeacherSample(messages=messages, multi_modal_data=multi_modal_data)
 ```
 
-verl is inspired by the design of Nemo-Aligner, Deepspeed-chat and OpenRLHF. The project is adopted and contributed by Bytedance, Anyscale, LMSys.org, [Alibaba Qwen team](https://github.com/QwenLM/), Shanghai AI Lab, Tsinghua University, UC Berkeley, UCLA, UIUC, University of Hong Kong, ke.com, [All Hands AI](https://www.all-hands.dev/), [ModelBest](http://modelbest.cn/), JD AI Lab, Microsoft Research, [StepFun](https://www.stepfun.com/), Amazon, LinkedIn, Meituan, [Camel-AI](https://www.camel-ai.org/), [OpenManus](https://github.com/OpenManus), Xiaomi, NVIDIA research, [Baichuan](https://www.baichuan-ai.com/home), [RedNote](https://www.xiaohongshu.com/), [SwissAI](https://www.swiss-ai.org/), [Moonshot AI (Kimi)](https://www.moonshot-ai.com/), Baidu, Snowflake, Skywork.ai, JetBrains, [IceSword Lab](https://www.iceswordlab.com), and many more.
+#### `build_one` 入参
 
-## Awesome Projects Built with `verl`
+| 参数 | 说明 |
+| --- | --- |
+| `prompt_messages` | 原始 chat messages（含多模态 segments） |
+| `multi_modal_data` | dict，key 为 `images` / `videos` / `audios` |
+| `extra_info` | 数据集行的 `extra_info`（gold answer、data_source 等） |
+| `prompt_text` | prompt 文本形式（调试用） |
 
-Welcome to register your awesome project build with `verl` for other developers' reference!
+`OnlineTeacherDataloader` 额外接收 `response_text` / `reward` / `batch_view` / `index`。
 
-- [TinyZero](https://github.com/Jiayi-Pan/TinyZero): a reproduction of **DeepSeek R1 Zero** recipe for reasoning tasks ![GitHub Repo stars](https://img.shields.io/github/stars/Jiayi-Pan/TinyZero)
-- [SkyThought](https://github.com/NovaSky-AI/SkyThought): RL training for Sky-T1-7B by NovaSky AI team. ![GitHub Repo stars](https://img.shields.io/github/stars/NovaSky-AI/SkyThought)
-- [simpleRL-reason](https://github.com/hkust-nlp/simpleRL-reason): SimpleRL-Zoo: Investigating and Taming Zero Reinforcement Learning for Open Base Models in the Wild ![GitHub Repo stars](https://img.shields.io/github/stars/hkust-nlp/simpleRL-reason)
-- [Easy-R1](https://github.com/hiyouga/EasyR1): **Multi-modal** RL training framework ![GitHub Repo stars](https://img.shields.io/github/stars/hiyouga/EasyR1)
-- [RandOpt](https://github.com/sunrainyg/RandOpt): Neural Thickets: Diverse Task Experts Are Dense Around Pretrained Weights ![GitHub Repo stars](https://img.shields.io/github/stars/sunrainyg/RandOpt)
-- [OpenManus-RL](https://github.com/OpenManus/OpenManus-RL): LLM Agents RL tuning framework for multiple agent environments. ![GitHub Repo stars](https://img.shields.io/github/stars/OpenManus/OpenManus-RL)
-- [rllm](https://github.com/agentica-project/rllm): async RL training with [verl-pipeline](https://github.com/agentica-project/verl-pipeline) ![GitHub Repo stars](https://img.shields.io/github/stars/agentica-project/rllm)
-- [RAGEN](https://github.com/ZihanWang314/ragen): a general-purpose reasoning **agent** training framework ![GitHub Repo stars](https://img.shields.io/github/stars/ZihanWang314/ragen)
-- [Search-R1](https://github.com/PeterGriffinJin/Search-R1): RL with reasoning and **searching (tool-call)** interleaved LLMs ![GitHub Repo stars](https://img.shields.io/github/stars/PeterGriffinJin/Search-R1)
-- [ReSearch](https://github.com/Agent-RL/ReSearch): Learning to **Re**ason with **Search** for LLMs via Reinforcement Learning ![GitHub Repo stars](https://img.shields.io/github/stars/Agent-RL/ReSearch)
-- [Skywork-OR1](https://github.com/SkyworkAI/Skywork-OR1): Skywork open reaonser series ![GitHub Repo stars](https://img.shields.io/github/stars/SkyworkAI/Skywork-OR1)
-- [ToRL](https://github.com/GAIR-NLP/ToRL): Scaling tool-integrated RL ![GitHub Repo stars](https://img.shields.io/github/stars/GAIR-NLP/ToRL)
-- [Absolute Zero Reasoner](https://github.com/LeapLabTHU/Absolute-Zero-Reasoner): [A no human curated data self-play framework for reasoning](https://arxiv.org/abs/2505.03335) ![GitHub Repo stars](https://img.shields.io/github/stars/LeapLabTHU/Absolute-Zero-Reasoner)
-- [verl-agent](https://github.com/langfengQ/verl-agent): A scalable training framework for **long-horizon LLM/VLM agents**, along with a new algorithm **GiGPO** ![GitHub Repo stars](https://img.shields.io/github/stars/langfengQ/verl-agent)
-- [RL-Factory](https://github.com/Simple-Efficient/RL-Factory): An easy and efficient RL post-training framework for Agentic Learning ![GitHub Repo stars](https://img.shields.io/github/stars/Simple-Efficient/RL-Factory)
-- [ReTool](https://retool-rl.github.io/): ReTool: reinforcement learning for strategic tool use in LLMs. Code release is in progress...
-- [verl-tool](https://github.com/TIGER-AI-Lab/verl-tool): An unified and easy-to-extend tool-agent training framework based on verl![GitHub Repo stars](https://img.shields.io/github/stars/TIGER-AI-Lab/verl-tool)
-- [PRIME](https://github.com/PRIME-RL/PRIME): Process reinforcement through implicit rewards ![GitHub Repo stars](https://img.shields.io/github/stars/PRIME-RL/PRIME)
-- [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent): MemAgent: Reshaping Long-Context LLM with Multi-Conv RL based Memory Agent ![GitHub Repo stars](https://img.shields.io/github/stars/BytedTsinghua-SIA/MemAgent)
-- [POLARIS](https://github.com/ChenxinAn-fdu/POLARIS): A Post-training recipe for scaling RL on Advanced Reasoning models ![GitHub Repo stars](https://img.shields.io/github/stars/ChenxinAn-fdu/POLARIS)
-- [GUI-R1](https://github.com/ritzz-ai/GUI-R1): **GUI-R1**: A Generalist R1-style Vision-Language Action Model For **GUI Agents** ![GitHub Repo stars](https://img.shields.io/github/stars/ritzz-ai/GUI-R1)
-- [DeepRetrieval](https://github.com/pat-jj/DeepRetrieval): RL Training of **Search Agent** with **Search/Retrieval Outcome** ![GitHub Repo stars](https://img.shields.io/github/stars/pat-jj/DeepRetrieval)
-- [Code-R1](https://github.com/ganler/code-r1): Reproducing R1 for **Code** with Reliable Rewards ![GitHub Repo stars](https://img.shields.io/github/stars/ganler/code-r1)
-- [DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher): Scaling deep research via reinforcement learning in real-world environments ![GitHub Repo stars](https://img.shields.io/github/stars/GAIR-NLP/DeepResearcher)
-- [VAGEN](https://github.com/RAGEN-AI/VAGEN): Training VLM agents with multi-turn reinforcement learning ![GitHub Repo stars](https://img.shields.io/github/stars/RAGEN-AI/VAGEN)
-- [RM-R1](https://arxiv.org/abs/2505.02387): RL training of reasoning reward models ![GitHub Repo stars](https://img.shields.io/github/stars/RM-R1-UIUC/RM-R1)
-- [Dr. MAS](https://arxiv.org/pdf/2602.08847): Stable **end-to-end RL** post-training for **multi-agent LLM systems** ![GitHub Repo stars](https://img.shields.io/github/stars/langfengQ/DrMAS)
-- [LUFFY](https://arxiv.org/pdf/2504.14945): Learning to Reason under Off-Policy Guidance![GitHub Repo stars](https://img.shields.io/github/stars/ElliottYan/LUFFY)
-- [DeepMath](https://github.com/zwhe99/DeepMath): DeepMath-103K data and series models for math reasoning![GitHub Repo stars](https://img.shields.io/github/stars/zwhe99/DeepMath)
-- [PACS](https://github.com/ritzz-ai/PACS): Implicit Actor Critic Coupling via a Supervised Learning Framework for RLVR ![GitHub Repo stars](https://img.shields.io/github/stars/ritzz-ai/PACS)
-- [Entropy Mechanism of RL](https://github.com/PRIME-RL/Entropy-Mechanism-of-RL): The Entropy Mechanism of Reinforcement Learning for Large Language Model Reasoning![GitHub Repo stars](https://img.shields.io/github/stars/PRIME-RL/Entropy-Mechanism-of-RL)
-- [LLaSA-TTS-GRPO](https://github.com/channel-io/ch-tts-llasa-rl-grpo): TTS fine-tuning with GRPO optimization based on LLASA models ![GitHub Repo stars](https://img.shields.io/github/stars/channel-io/ch-tts-llasa-rl-grpo)
-- [PF-PPO](https://arxiv.org/abs/2409.06957): Policy Filtration for PPO based on the reliability of reward signals for more efficient and robust RLHF.
-- [RACRO](https://github.com/gyhdog99/RACRO2): Build multi-modal reasoning models via decoupling it into query-conditioned captioning and text-only reasoning ![GitHub Repo stars](https://img.shields.io/github/stars/gyhdog99/RACRO2)
-- [Agent Lightning](https://github.com/microsoft/agent-lightning): A flexible and extensible framework that enables seamless agent optimization for any existing agent framework. ![GitHub Repo stars](https://img.shields.io/github/stars/microsoft/agent-lightning)
-- [VTool-R1](https://github.com/VTOOL-R1/vtool-r1): VLMs Learn to Think with Images via Reinforcement Learning on Multimodal Tool Use. ![GitHub Repo stars](https://img.shields.io/github/stars/VTOOL-R1/vtool-r1)
-- [Kimina-Prover-RL](https://github.com/project-numina/kimina-prover-rl/tree/main/recipe/kimina_prover_rl): Training pipeline for formal theorem proving, based on a paradigm inspired by DeepSeek-R1.
-- [RL-PLUS](https://github.com/YihongDong/RL-PLUS): Countering Capability Boundary Collapse of LLMs in Reinforcement Learning with Hybrid-policy Optimization.
-- [rStar2-Agent](https://github.com/microsoft/rStar): Using reinforcement learning with multi-step tool-calling for math tasks, rStar2-Agent-14B reaches frontier-level math reasoning in just 510 RL training steps ![GitHub Repo stars](https://img.shields.io/github/stars/microsoft/rStar)
-- [Vision-SR1](https://github.com/zli12321/Vision-SR1): Self-Rewarding Vision-Language Model via Reasoning Decomposition ![GitHub Repo stars](https://img.shields.io/github/stars/zli12321/Vision-SR1)
-- [SimpleVLA-RL](https://github.com/PRIME-RL/SimpleVLA-RL): SimpleVLA-RL: A Simple yet Effective Vision-Language Action Model for Reinforcement Learning ![GitHub Repo stars](https://img.shields.io/github/stars/PRIME-RL/SimpleVLA-RL)
-- [Table-R1](https://github.com/Table-R1/Table-R1): Table-R1: Inference-Time Scaling for Table Reasoning ![GitHub Repo stars](https://img.shields.io/github/stars/Table-R1/Table-R1)
-- [Revisual-R1](https://github.com/CSfufu/Revisual-R1): Revisual-R1: Advancing Multimodal Reasoning From Optimized Cold Start to Staged Reinforcement Learning ![GitHub Repo stars](https://img.shields.io/github/stars/CSfufu/Revisual-R1)
-- [ARES](https://github.com/shawn0728/ARES): ARES: Multimodal Adaptive Reasoning via Difficulty-Aware Token-Level Entropy Shaping ![GitHub Repo stars](https://img.shields.io/github/stars/shawn0728/ARES)
-- [Meta-Bandit-LLM](https://github.com/sanxing-chen/meta-bandit-llm): Meta-Bandit-LLM: Long-horizon multiturn interactive training for meta-bandit agents ![GitHub Repo stars](https://img.shields.io/github/stars/sanxing-chen/meta-bandit-llm)
-- [PokeeResearch](https://github.com/Pokee-AI/PokeeResearchOSS): PokeeResearch: State-of-the-art 7B DeepResearch Agent that leverages web search and content reading capabilities to answer complex questions using the most up-to-date information available online. ![Github Repo Stars](https://img.shields.io/github/stars/Pokee-AI/PokeeResearchOSS)
-- [Search Self-play](https://github.com/Alibaba-Quark/SSP): Pushing the Frontier of Agent Capability without Supervision ![GitHub Repo stars](https://img.shields.io/github/stars/Alibaba-Quark/SSP)
-- [OneThinker](https://github.com/tulerfeng/OneThinker): All-in-one Reasoning Model for Image and Video ![GitHub Repo stars](https://img.shields.io/github/stars/tulerfeng/OneThinker)
-- [OpenTinker](https://github.com/open-tinker/OpenTinker): Democratizing Agentic Reinforcement Learning as a Service ![GitHub Repo stars](https://img.shields.io/github/stars/open-tinker/OpenTinker)
-- [FlowRL](https://github.com/Xuekai-Zhu/FlowRL): Matching reward distributions via **flow balance** for diverse exploration and generalizable reasoning ![GitHub Repo stars](https://img.shields.io/github/stars/Xuekai-Zhu/FlowRL)
-- [Logic-RL](https://github.com/Unakar/Logic-RL): a reproduction of DeepSeek R1 Zero on 2K Tiny Logic Puzzle Dataset. ![GitHub Repo stars](https://img.shields.io/github/stars/Unakar/Logic-RL)
-- [Seed-Coder](https://github.com/ByteDance-Seed/Seed-Coder): RL training of Seed-Coder boosts performance on competitive programming ![GitHub Repo stars](https://img.shields.io/github/stars/ByteDance-Seed/Seed-Coder)
-- [all-hands/openhands-lm-32b-v0.1](https://www.all-hands.dev/blog/introducing-openhands-lm-32b----a-strong-open-coding-agent-model): A strong, open coding agent model, trained with [multi-turn fine-tuning](https://github.com/verl-project/verl/pull/195)
-- [s3](https://github.com/pat-jj/s3) **Efficient Yet Effective** Search Agent Training via RL ![GitHub Repo stars](https://img.shields.io/github/stars/pat-jj/s3)
-- [Rec-R1](https://arxiv.org/pdf/2503.24289): Bridging Generative Large Language Models and Recommendation Systems via Reinforcement Learning
-- [Explore RL Data Scaling](https://arxiv.org/abs/2503.22230): Exploring Data Scaling Trends and Effects in Reinforcement Learning from Human Feedback
-- [FIRE](https://arxiv.org/abs/2410.21236): Flaming-hot initiation with regular execution sampling for large language models
-- [DQO](https://arxiv.org/abs/2410.09302): Enhancing multi-Step reasoning abilities of language models through direct Q-function optimization
-- [ProRL](https://arxiv.org/abs/2505.24864): Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models
-- [cognition-engineering](https://github.com/gair-nlp/cognition-engineering): Test time scaling drives cognition engineering. ![GitHub Repo stars](https://img.shields.io/github/stars/gair-nlp/cognition-engineering)
-- [Trust Region Preference Approximation](https://github.com/XueruiSu/Trust-Region-Preference-Approximation): A simple and stable **reinforcement learning algorithm** for LLM reasoning. ![GitHub Repo stars](https://img.shields.io/github/stars/XueruiSu/Trust-Region-Preference-Approximation)
-- [AdaRFT](https://github.com/uscnlp-lime/verl): Efficient Reinforcement Finetuning via **Adaptive Curriculum Learning** ![GitHub Repo stars](https://img.shields.io/github/stars/uscnlp-lime/verl)
-- [critic-rl](https://github.com/HKUNLP/critic-rl): LLM critics for code generation ![GitHub Repo stars](https://img.shields.io/github/stars/HKUNLP/critic-rl)
-- [self-rewarding-reasoning-LLM](https://arxiv.org/pdf/2502.19613): self-rewarding and correction with **generative reward models** ![GitHub Repo stars](https://img.shields.io/github/stars/RLHFlow/Self-rewarding-reasoning-LLM)
-- [DeepEnlighten](https://github.com/DolbyUUU/DeepEnlighten): Reproduce R1 with **social reasoning** tasks and analyze key findings ![GitHub Repo stars](https://img.shields.io/github/stars/DolbyUUU/DeepEnlighten)
-- [MetaSpatial](https://github.com/PzySeere/MetaSpatial): Reinforcing **3D Spatial Reasoning** in **VLMs** for the **Metaverse** ![GitHub Repo stars](https://img.shields.io/github/stars/PzySeere/MetaSpatial)
-- [PURE](https://github.com/CJReinforce/PURE): **Credit assignment** is the key to successful reinforcement fine-tuning using **process reward model** ![GitHub Repo stars](https://img.shields.io/github/stars/CJReinforce/PURE)
-- [cognitive-behaviors](https://github.com/kanishkg/cognitive-behaviors): Cognitive Behaviors that Enable Self-Improving Reasoners, or, Four Habits of Highly Effective STaRs ![GitHub Repo stars](https://img.shields.io/github/stars/kanishkg/cognitive-behaviors)
-- [deepscaler](https://github.com/agentica-project/rllm/tree/deepscaler): iterative context scaling with GRPO ![GitHub Repo stars](https://img.shields.io/github/stars/agentica-project/deepscaler)
-- [DAPO](https://dapo-sia.github.io/): the fully open source SOTA RL algorithm that beats DeepSeek-R1-zero-32B ![GitHub Repo stars](https://img.shields.io/github/stars/verl-project/verl)
-- [NoisyRollout](https://github.com/NUS-TRAIL/NoisyRollout): Reinforcing Visual Reasoning with Data Augmentation ![GitHub Repo stars](https://img.shields.io/github/stars/NUS-TRAIL/NoisyRollout)
-- [SPEAR](https://github.com/TencentYoutuResearch/SPEAR): **Self-imitation** with **Progressive Exploration** for Agentic Reinforcement Learning (ICLR 2026) ![GitHub Repo stars](https://img.shields.io/github/stars/TencentYoutuResearch/SPEAR)
-- [RuleReasoner](https://github.com/bigai-nlco/RuleReasoner): **RuleReasoner:** Reinforced Rule-based Reasoning via **Domain-aware Dynamic Sampling** (ICLR 2026) ![GitHub Repo stars](https://img.shields.io/github/stars/bigai-nlco/RuleReasoner)
-- [MetaphorStar](https://metaphorstar.github.io/): **Image Metaphor** Understanding and Reasoning with End-to-End **Visual Reinforcement Learning** ![GitHub Repo stars](https://img.shields.io/github/stars/MING-ZCH/MetaphorStar)
-- [DART-GUI](https://github.com/Computer-use-agents/dart-gui): a decoupled agentic RL framework for Computer Use Agents, achieving ~2× training speedup and ~5× environment utilization! ![GitHub Repo stars](https://img.shields.io/github/stars/Computer-use-agents/dart-gui)
+无效样本返回 `TeacherSample(messages=[], skip=True)`，该条蒸馏 loss 会被自动 mask。
 
-## Contribution Guide
+**注意事项**：
+- 修改 `prompt_messages` 前一定 `copy.deepcopy`，否则会污染 batch 其他字段。
+- `multi_modal_data` 使用**复数** key（`images` / `videos` / `audios`）。
+- `__init__(**kwargs)` 接收 yaml 中 `self_distill.dataloader_kwargs` 的所有键值，用 `self.config["my_param"]` 访问。
 
-See [contributions guide](CONTRIBUTING.md)
+### Step 2：启动训练
 
-## About [ByteDance Seed Team](https://team.doubao.com/)
+```bash
+distillation.enabled=True \
+distillation.mode=self \
+distillation.self_distill.dataloader=my_pkg.opsd:GoldAnswerTeacher \
+distillation.distillation_loss.loss_mode=k3 \
+distillation.distillation_loss.use_task_rewards=True \
+distillation.distillation_loss.use_policy_gradient=False
+```
 
-Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society. You can get to know Bytedance Seed better through the following channels👇
+就这三条加上你已有的 PPO/GRPO 启动命令即可。**不需要**配 `distillation.teacher_models / n_gpus_per_node / nnodes`——OPSD 完全复用 colocated 的 ref policy。
 
-<div>
-  <a href="https://team.doubao.com/">
-    <img src="https://img.shields.io/badge/Website-%231e37ff?style=for-the-badge&logo=bytedance&logoColor=white"></a>
-  <a href="https://github.com/user-attachments/assets/469535a8-42f2-4797-acdf-4f7a1d4a0c3e">
-    <img src="https://img.shields.io/badge/WeChat-07C160?style=for-the-badge&logo=wechat&logoColor=white"></a>
- <a href="https://www.xiaohongshu.com/user/profile/668e7e15000000000303157d?xsec_token=ABl2-aqekpytY6A8TuxjrwnZskU-6BsMRE_ufQQaSAvjc%3D&xsec_source=pc_search">
-    <img src="https://img.shields.io/badge/Xiaohongshu-%23FF2442?style=for-the-badge&logo=xiaohongshu&logoColor=white"></a>
-  <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
-    <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
-</div>
+完整脚本（通用 OPSD 模板）：[`../on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh`](../on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh)。
 
-We are HIRING! Send us an [email](mailto:the.verl.project@gmail.com) if you are interested in internship/FTE opportunities in RL for agents.
+如果你想直接跑仓库里已经对齐过当前实现的配方，优先看本目录下的三个脚本：[`run_qwen_opsd.sh`](./run_qwen_opsd.sh) / [`run_qwen_sdpo.sh`](./run_qwen_sdpo.sh) / [`run_qwen_vision_opd.sh`](./run_qwen_vision_opd.sh)。
+
+### Step 3：三个具体例子
+
+下面三个示例展示了同一套 OPSD 框架如何覆盖 OPSD / SDPO / Vision-OPD。对应的可直接运行的 teacher dataloader 示例放在 [`./teacher_dataloader/`](./teacher_dataloader/)。
+
+| 配方 | 启动脚本 | teacher 注入 | loss | teacher 更新 |
+|---|---|---|---|---|
+| **OPSD**（原 paper 复现） | [run_qwen_opsd.sh](./run_qwen_opsd.sh) | 把 `extra_info.{solution,reference_solution,answer}` 中的参考解答重写进最后一条 user turn | `kl_family=sdpo, sdpo.alpha=0.0, sdpo.mode=topk, sdpo.tail=renorm, topk=128, loss_max_clamp=0.05` | `ref` 固定 |
+| **SDPO** | [run_qwen_sdpo.sh](./run_qwen_sdpo.sh) | 把同一 UID 下 reward 足够高的 sibling rollout 作为 reprompt 示范拼回 prompt | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+| **Vision-OPD** | [run_qwen_vision_opd.sh](./run_qwen_vision_opd.sh) | teacher 侧复用原始文本 prompt，但把图像替换成 `extra_info.bbox_images` 指向的 bbox 版本 | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+
+### Step 4：常用组合速查
+
+- **基线（监督式 KD）**：`loss_mode=k3, use_policy_gradient=False` ——稳，先用这个跑通。
+- **配合 GRPO**：`algorithm.adv_estimator=grpo, rollout.n=4`，蒸馏与 advantage 无耦合，正交叠加即可。
+- **top-K 反向 KL**：`kl_family=sdpo, sdpo.alpha=1.0, sdpo.tail=add` ——更细致的分布级监督，慢一点。
+
+---
+
+## 2. 工作原理（30 秒理解）
+
+```
+student rollout (prompt, response)
+    │
+    ▼
+your dataloader.build_one()  →  TeacherSample(messages=...)
+    │
+    ▼
+verl 自动 tokenize teacher messages，拼上 student response tokens
+    │
+    ▼
+ref policy forward → teacher_logprobs
+    │
+    ▼
+复用 OPD loss kernel：蒸馏 loss 与任务奖励并行生效
+```
+
+关键点：
+- Student 和 teacher 共用同一个进程、同一份 FSDP shard、同一个 tokenizer/processor。
+- "教师"的本质只是**一次 prompt 不同的 ref forward**，因此 OPSD 没有任何额外 GPU 开销。
+- 教师权重可以静态固定（`ref`），也可以让它跟着 student 走（`ema`/`progressive`/`trust_region`）。
+
+---
+
+## 3. 超参数参考
+
+下面只列 OPSD（`distillation.mode=self`）下实际生效的字段，按命名空间分组。每条标注：类型、可选值/取值范围、默认值与作用。
+
+### 3.1 顶层 `distillation.*`
+
+- **`enabled`**（bool，`true` / `false`，默认 `false`）：蒸馏总开关，关闭时完全不走蒸馏分支。
+- **`mode`**（str，`external` / `self`，默认 `external`）：教师来源。`external` 走外挂教师模型；`self` 复用同进程 ref policy，OPSD 必须设为 `self`。
+
+### 3.2 蒸馏 loss `distillation.distillation_loss.*`
+
+公共字段：
+
+- **`kl_family`**（str，`verl` / `sdpo`，默认 `verl`）：loss 实现家族。`verl` 走原版 estimator/top-K kernel；`sdpo` 走 alpha-KL 路径，并按 `sdpo.mode` 自动改写 `loss_mode`。
+- **`loss_mode`**（str，默认 `k3`）：具体的 loss kernel，可选：
+  - 单样本 KL 估计器：`k1`、`k2`、`k3`、`kl`、`low_var_kl`；
+  - logprob 距离：`abs`（绝对值）、`mse`（平方）；
+  - top-K 分布级 KL：`forward_kl_topk`、`reverse_kl_topk`。
+  仅在 `kl_family=verl` 时按此值生效；`kl_family=sdpo` 时会被覆盖为 `sdpo_alpha_kl_topk` 或 `sdpo_alpha_kl_sampled`。
+- **`topk`**（int，`> 0`，默认 `32`）：教师 top-K 截断的 K 值，仅 top-K 类 loss（`forward_kl_topk` / `reverse_kl_topk` / `sdpo_alpha_kl_topk`）使用。
+- **`use_task_rewards`**（bool，默认 `true`）：`true` 时蒸馏 loss 与任务 reward 并行；`false` 时纯蒸馏，忽略 RL reward。
+- **`distillation_loss_coef`**（float，`>= 0`，默认 `1.0`）：蒸馏 loss 与任务 loss 相加时的权重。
+- **`loss_max_clamp`**（float 或 `null`，默认 `10.0`）：蒸馏 loss 逐 token 绝对值上界，防止极端 token 主导梯度；设 `null` 关闭。
+- **`log_prob_min_clamp`**（float 或 `null`，默认 `-10.0`）：把 logprob 下截到该值，避免 `log 0` 造成 inf/nan；设 `null` 关闭。
+- **`use_policy_gradient`**（bool，默认 `true`）：是否把蒸馏目标当作 PG surrogate（套 PPO ratio + clip）。`false` 走直接监督式优化；`loss_mode=k1` 必须为 `true`。
+- **`policy_loss_mode`**（str，仅 `vanilla`，默认 `vanilla`）：PG 形式下的 surrogate 类型，当前仅实现标准 PPO surrogate，其它值抛 `NotImplementedError`。仅 `use_policy_gradient=true` 时读取。
+- **`clip_ratio` / `clip_ratio_low` / `clip_ratio_high`**（float，`> 0`，默认均 `0.2`）：PPO ratio 的 clip 半径。仅 `use_policy_gradient=true` 时读取。
+
+SDPO 子组 `distillation.distillation_loss.sdpo.*`（仅 `kl_family=sdpo` 时读取）：
+
+- **`alpha`**（float，`[0.0, 1.0]`，默认 `1.0`）：alpha-KL 的插值系数，控制 forward↔reverse KL 取向。常用 `0.0`（forward KL）、`0.5`（JSD）、`1.0`（reverse KL）。
+- **`mode`**（str，`topk` / `full` / `sampled`，默认 `topk`）：alpha-KL 的估计方式。`topk` 在教师 top-K 上做精确 alpha-KL；`sampled` 用学生采样到的单 token 估计（退化为 k3 反向 KL），仅 `alpha=1.0` 合法；`full` 全词表，尚未实现。
+- **`tail`**（str，`add` / `renorm` / `drop`，默认 `add`）：教师 top-K 之外剩余概率的处理。`add` 把 `1−Σp_i` 合并为虚拟 K+1 桶；`renorm` 把 top-K 重新归一化到 1；`drop` 直接丢掉 tail。仅 `mode=topk` 生效。
+- **`ratio_clip`**（float 或 `null`，`> 0`，默认 `null`）：每 token 重要性权重 `exp(s − s_old)` 的上截阈值，抑制单 token 主导。仅 `mode=topk` 生效。
+
+`reverse_kl_topk` 专用字段（只在 `loss_mode=reverse_kl_topk` 下读取）：
+
+- **`norm_to_one_for_kl`**（bool，默认 `true`）：是否把教师 top-K 概率归一化到 1 再算 KL，等价于 SDPO `tail=renorm`。
+- **`clip_log_ratio`**（bool，默认 `false`）：把 `log p_student − log p_teacher` clamp 到 `[-5, 5]`，防数值爆炸。
+- **`use_tail_sampling`**（bool，默认 `false`）：用学生采样到的 token 作为 K+1 位补回，对其在 top-K 外的位置加 L2，补偿 top-K 截断偏差。
+- **`use_kl_iw`**（bool，默认 `false`）：给 tail-sampling 的 L2 项乘以重要性权重 `exp(log π − log π_old)`。
+- **`kl_iw_clip_lower` / `kl_iw_clip_upper`**（float 或 `null`，默认 `null`）：上述重要性权重的下/上截阈值。
+- **`opd_mask_special_tokens`**（bool，默认 `false`）：是否在 loss 中 mask 掉每条 response 首个特殊 token，规避教师-学生 special token 不一致。OPSD 词表共享时启用会被忽略并 warning。
+- **`opd_mask_first_tokens`**（list[str]，默认 `['<', 'think', '<|im_end|>']`）：上一项启用时要 mask 的 token 字面量列表，启动时由 tokenizer 转成 token ids。
+
+### 3.3 OPSD 专用 `distillation.self_distill.*`
+
+仅 `distillation.mode=self` 时读取；在 `distillation.mode=external` 下显式设置这一组任何字段都会被拒绝（trainer 启动时报错），因为外挂教师是独立进程，trainer 无法对它做 EMA / 周期硬拷贝 / trust-region 更新。
+
+- **`dataloader`**（str，默认 `null`，**必填**）：teacher dataloader 的 importable FQN，形如 `pkg.module:Class`。类必须继承 `OfflineTeacherDataloader` 或 `OnlineTeacherDataloader`，用来定义每个样本如何被改写成教师 prompt。
+- **`dataloader_kwargs`**（dict，默认 `{}`）：原样透传到 dataloader 的 `__init__(**kwargs)`，方便传入自定义超参。
+- **`teacher_update`**（str，`ref` / `ema` / `progressive` / `trust_region`，默认 `ema`）：教师权重更新策略。
+  - `ref`：教师永远固定，等同标准 KD；
+  - `ema`：`ref ← decay · ref + (1 − decay) · actor`，平滑跟随学生；
+  - `progressive`：每隔若干步硬拷贝学生权重；
+  - `trust_region`：当 KL(student‖teacher) 达阈值后才硬拷贝。
+- **`ema_decay`**（float，`(0.0, 1.0)`，默认 `0.999`）：EMA 衰减系数，值越大教师越滞后。仅 `teacher_update=ema` 生效。
+- **`teacher_update_rate`**（float，`>= 0`，默认 `0.0`）：EMA 的等价参数。非 0 时覆盖 `ema_decay`，对应 `ema_decay = 1 − teacher_update_rate`。
+- **`teacher_update_interval`**（int，`> 0`，默认 `0`）：progressive 模式下硬拷贝学生权重的间隔步数，progressive 模式必填。
+- **`trust_region_threshold`**（float，`>= 0`，默认 `0.0`）：trust_region 模式下触发硬拷贝的 KL 阈值。
+- **`truncation`**（str，`left` / `right` / `error`，默认 `right`）：教师 prompt 超过 `data.max_prompt_length` 时的截断策略，分别表示左截/右截/直接报错。
+
+---
+
+## 4. 当前限制
+
+- top-K kernel（forward/reverse/sdpo_alpha_kl_topk）仅 FSDP 后端有 OPSD 端的 teacher top-K 抽取；Megatron 后端需走 estimator 路径。
+- `sdpo.mode=full`（全词表 alpha-KL）尚未接通。
+
+---
+
+## 5. 常见问题
+
+| 现象 | 解决 |
+|---|---|
+| `self_distill.dataloader` 为空 | 必须设置，格式 `pkg.module:Class` |
+| `... is not a subclass of OfflineTeacherDataloader or OnlineTeacherDataloader` | 你的类必须继承其中一个基类 |
+| `ValueError: teacher_update must be one of ...` | 检查拼写（`ref`/`ema`/`progressive`/`trust_region`） |
+| `OPSD progressive teacher requires teacher_update_interval > 0` | progressive 模式必须设 `teacher_update_interval` |
+| `OPSD ema teacher requires 0 < ema_decay < 1` | 调 `ema_decay` 到 (0, 1) |
+| `NotImplementedError: ... topk distillation losses` (Megatron) | 改用 estimator 路径（`loss_mode=k3` 等） |
+| 蒸馏 loss 一直为 0 | 多半是 dataloader 全部返回 `skip=True`，检查 `extra_info` 字段 |
+| Teacher prompt 被截断 | 提高 `data.max_prompt_length` 或改 `truncation=left` |
+| `KeyError: sampled_teacher_logprob` | 启用了 `use_tail_sampling=True` 但走的不是 OPSD topk 路径；OPD 外挂教师需自行 plumbing 该字段 |

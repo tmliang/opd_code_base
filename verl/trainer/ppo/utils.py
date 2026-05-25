@@ -82,8 +82,15 @@ def need_reference_policy(
 def need_teacher_policy(
     config: DictConfig,
 ) -> bool:
-    """Given the config, do we need distillation policy."""
-    return is_distillation_enabled(config.get("distillation"))
+    """Given the config, do we need a dedicated teacher Ray cluster.
+
+    Returns False for OPSD (``distillation.mode == "self"``), where the teacher
+    runs colocated with the actor and no extra resource pool is required.
+    """
+    distill = config.get("distillation")
+    if not is_distillation_enabled(distill):
+        return False
+    return distill.get("mode", "external") != "self"
 
 
 def need_reward_model(

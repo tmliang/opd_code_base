@@ -1060,6 +1060,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        teacher_topk_request = int(
+            tu.get_non_tensor_data(data=micro_batch, key="teacher_topk_request", default=0)
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1117,6 +1120,28 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             pad_size = output_args["pad_size"]
                             v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                         model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
+                # Teacher-side raw top-k logprobs/ids (used by OPSD when SDPO topk mode is on).
+                if teacher_topk_request > 0:
+                    teacher_logp = logits_rmpad.log_softmax(dim=-1)
+                    teacher_topk_vals, teacher_topk_ids = torch.topk(
+                        teacher_logp, k=min(teacher_topk_request, teacher_logp.shape[-1]), dim=-1
+                    )
+                    if self.use_ulysses_sp:
+                        pad_size = output_args["pad_size"]
+                        teacher_topk_vals = gather_outputs_and_unpad(
+                            teacher_topk_vals, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
+                        teacher_topk_ids = gather_outputs_and_unpad(
+                            teacher_topk_ids, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
+                    cu_seqlens = input_ids.offsets()
+                    model_output["teacher_topk_log_probs"] = torch.nested.nested_tensor_from_jagged(
+                        teacher_topk_vals, cu_seqlens
+                    )
+                    model_output["teacher_topk_ids"] = torch.nested.nested_tensor_from_jagged(
+                        teacher_topk_ids, cu_seqlens
+                    )
 
             # gather log_prob if sp > 1
             if self.use_ulysses_sp:
@@ -1198,6 +1223,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
+                    if teacher_topk_request > 0:
+                        teacher_logp = logits_rmpad.log_softmax(dim=-1)
+                        teacher_topk_vals, teacher_topk_ids = torch.topk(
+                            teacher_logp, k=min(teacher_topk_request, teacher_logp.shape[-1]), dim=-1
+                        )
+                        model_output["teacher_topk_log_probs"] = torch.nested.nested_tensor_from_jagged(
+                            teacher_topk_vals, cu_seqlens
+                        )
+                        model_output["teacher_topk_ids"] = torch.nested.nested_tensor_from_jagged(
+                            teacher_topk_ids, cu_seqlens
+                        )
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)

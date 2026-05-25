@@ -294,6 +294,32 @@ class RayPPOTrainer:
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
 
+        # OPSD (on-policy self-distillation): teacher colocated with actor.
+        distill_cfg = self.config.get("distillation")
+        self.use_self_distillation = bool(
+            is_distillation_enabled(distill_cfg) and distill_cfg.get("mode", "external") == "self"
+        )
+        if self.use_self_distillation:
+            # OPSD always needs the ref policy loaded: it is either the frozen
+            # teacher (teacher_update="ref") or the mutable EMA /
+            # progressive / trust-region snapshot of the student.
+            self.use_reference_policy = True
+
+        # Group-normalised advantage estimators (GRPO/RLOO/...) collapse to 0
+        # when n==1, so a task-reward term is wasted compute. Catch this early.
+        if is_distillation_enabled(distill_cfg) and bool(
+            distill_cfg.distillation_loss.get("use_task_rewards", True)
+        ):
+            n = int(self.config.actor_rollout_ref.rollout.get("n", 1))
+            adv = str(self.config.algorithm.adv_estimator)
+            grouped = {"grpo", "grpo_passk", "rloo", "reinforce_plus_plus_baseline", "opo"}
+            assert not (adv in grouped and n <= 1), (
+                f"distillation.distillation_loss.use_task_rewards=True with "
+                f"algorithm.adv_estimator={adv!r} requires actor_rollout_ref.rollout.n > 1 "
+                f"(got n={n}); group-normalised advantages collapse to 0 for n=1. "
+                f"Set use_task_rewards=False or raise rollout.n."
+            )
+
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
@@ -873,6 +899,10 @@ class RayPPOTrainer:
                 resource_pool=teacher_resource_pool,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        elif self.use_self_distillation:
+            self.teacher_model_manager = None
+            self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+            self._init_self_distillation_runtime()
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
@@ -1179,7 +1209,7 @@ class RayPPOTrainer:
         values = DataProto.from_tensordict(values)
         return values
 
-    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+    def _compute_ref_log_prob(self, batch: DataProto, teacher_topk_request: int = 0) -> DataProto:
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1188,6 +1218,8 @@ class RayPPOTrainer:
         metadata = {"calculate_entropy": False, "compute_loss": False}
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
+        if teacher_topk_request > 0:
+            metadata["teacher_topk_request"] = int(teacher_topk_request)
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
@@ -1198,10 +1230,218 @@ class RayPPOTrainer:
         # step 4. No padding to padding
         log_probs = no_padding_2_padding(log_probs, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
-        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
+        result = {"ref_log_prob": log_probs.float()}
+        if teacher_topk_request > 0:
+            topk_logp = tu.get(output, "teacher_topk_log_probs")
+            topk_ids = tu.get(output, "teacher_topk_ids")
+            result["teacher_topk_log_probs"] = no_padding_2_padding(topk_logp, batch_td).float()
+            result["teacher_topk_ids"] = no_padding_2_padding(topk_ids, batch_td).long()
+        ref_log_prob = tu.get_tensordict(result)
         ref_log_prob = DataProto.from_tensordict(ref_log_prob)
 
         return ref_log_prob
+
+    # ------------------------------------------------------------- OPSD hooks
+
+    def _init_self_distillation_runtime(self) -> None:
+        """Instantiate the OPSD runtime (teacher dataloader + tokenizer pipeline)."""
+        from verl.workers.self_distillation import (
+            SelfDistillationRuntime,
+            load_teacher_dataloader_from_spec,
+        )
+
+        sd_cfg = self.distillation_config.self_distill
+        spec = {
+            "target": sd_cfg.dataloader,
+            "kwargs": dict(sd_cfg.dataloader_kwargs),
+        }
+        dataloader = load_teacher_dataloader_from_spec(
+            spec, tokenizer=self.tokenizer, processor=self.processor
+        )
+        if dataloader is None:
+            raise ValueError("OPSD enabled but self_distill.dataloader is empty.")
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        self.self_distillation_runtime = SelfDistillationRuntime(
+            teacher_dataloader=dataloader,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            max_prompt_length=int(self.config.data.max_prompt_length),
+            pad_token_id=int(pad_token_id),
+            truncation=sd_cfg.truncation,
+        )
+
+    def _compute_self_distill_teacher_log_prob(self, batch: DataProto) -> DataProto:
+        """OPSD: forward the reference policy on the teacher prompt + student response.
+
+        Sampled-token path (default): writes ``teacher_logprobs`` (B, T_resp, 1)
+        and ``teacher_ids`` (B, T_resp, 1) — the shape consumed by estimator-mode
+        loss kernels (k1/k3/abs/mse/low_var_kl/kl, and SDPO ``sampled`` mode).
+
+        Top-k path (when ``loss_settings.use_topk`` is True, i.e. ``forward_kl_topk``
+        or ``sdpo_alpha_kl_topk``): also requests teacher top-k logprobs+ids from
+        the ref forward and writes them as ``teacher_logprobs`` (B, T_resp, k) /
+        ``teacher_ids`` (B, T_resp, k). A sampled-token copy is preserved as
+        ``teacher_sampled_logprob`` (B, T_resp) for the trust-region KL metric.
+        """
+        loss_cfg = self.distillation_config.distillation_loss
+        loss_mode = loss_cfg.loss_mode
+        use_topk = loss_cfg.loss_settings.use_topk
+        topk_k = int(loss_cfg.topk) if use_topk else 0
+        if use_topk and topk_k <= 0:
+            raise ValueError(
+                f"loss_mode={loss_mode!r} requires distillation_loss.topk > 0, got {topk_k}."
+            )
+
+        # 1) build teacher inputs on a cloned view of the batch
+        teacher_batch = DataProto.from_tensordict(batch.batch.clone(recurse=True))
+        teacher_batch.non_tensor_batch = dict(batch.non_tensor_batch)
+        self.self_distillation_runtime.apply(teacher_batch)
+
+        # 2) swap student prompt fields with the teacher's; `responses` unchanged
+        td = teacher_batch.batch
+        td["input_ids"] = td["teacher_full_input_ids"]
+        td["attention_mask"] = td["teacher_full_attention_mask"]
+        td["position_ids"] = td["teacher_full_position_ids"]
+        td["prompts"] = td["teacher_input_ids"]
+
+        # If the dataloader produced re-encoded teacher multi-modal inputs
+        # (e.g. teacher-side images differ from student), route them into the
+        # engine's ``multi_modal_inputs`` slot so the vision backbone sees the
+        # tensors that match the teacher input_ids. The runtime already drops
+        # ``mm_token_type_ids`` (variable per-sample length, consumed during
+        # rope-index computation) so a simple key rename is sufficient.
+        if "teacher_multi_modal_inputs" in teacher_batch.non_tensor_batch:
+            teacher_batch.non_tensor_batch["multi_modal_inputs"] = (
+                teacher_batch.non_tensor_batch["teacher_multi_modal_inputs"]
+            )
+
+        # 3) forward through the reference policy (or actor when ref_in_actor)
+        ref_view = DataProto.from_tensordict(td)
+        ref_view.non_tensor_batch = teacher_batch.non_tensor_batch
+        # Propagate parent meta_info (e.g. ``temperature``) — ``from_tensordict``
+        # builds a fresh DataProto whose meta_info is empty, and the FSDP engine's
+        # ``prepare_model_inputs`` hard-requires ``temperature``.
+        ref_view.meta_info = dict(batch.meta_info)
+        ref_out = self._compute_ref_log_prob(ref_view, teacher_topk_request=topk_k)
+        sampled_lp = ref_out.batch["ref_log_prob"].float()  # (B, T_resp)
+
+        sd_mask = teacher_batch.batch["self_distillation_mask"]
+        out: dict = {"self_distillation_mask": sd_mask}
+
+        if use_topk:
+            import torch.nn.functional as F
+
+            topk_lp = ref_out.batch["teacher_topk_log_probs"].float()  # (B, max_resp, k)
+            topk_ids = ref_out.batch["teacher_topk_ids"].long()  # (B, max_resp, k)
+            # Pad to full sequence shape (B, T_full_student, k) by left-padding
+            # zeros across the student prompt portion. Matches the OPD external
+            # teacher convention so left_right_2_no_padding can re-extract them.
+            T_full = batch.batch["attention_mask"].shape[1]
+            student_prompt_width = T_full - topk_lp.shape[1]
+            if student_prompt_width < 0:
+                raise RuntimeError(
+                    f"student attention_mask width {T_full} smaller than teacher response "
+                    f"width {topk_lp.shape[1]} — cannot align OPSD top-k teacher tensors."
+                )
+            topk_lp = F.pad(topk_lp, (0, 0, student_prompt_width, 0))
+            topk_ids = F.pad(topk_ids, (0, 0, student_prompt_width, 0))
+            if not bool(sd_mask.all()):
+                mask3 = sd_mask.view(-1, 1, 1).to(topk_lp.dtype)
+                topk_lp = topk_lp * mask3
+                # ids stay intact; the kernel only uses them for gather
+            out["teacher_logprobs"] = topk_lp
+            out["teacher_ids"] = topk_ids
+            out["teacher_sampled_logprob"] = sampled_lp
+        else:
+            import torch.nn.functional as F
+
+            teacher_logprobs = sampled_lp.unsqueeze(-1)  # (B, max_resp, 1)
+            teacher_ids = batch.batch["responses"].long().unsqueeze(-1)  # (B, max_resp, 1)
+            if not bool(sd_mask.all()):
+                mask = sd_mask.view(-1, 1, 1).to(teacher_logprobs.dtype)
+                teacher_logprobs = teacher_logprobs * mask
+            # Pad to (B, T_full_student, 1) so left_right_2_no_padding can
+            # turn them into nested tensors keyed by the student attention_mask
+            # — same convention as the OPD external-teacher path.
+            T_full = batch.batch["attention_mask"].shape[1]
+            student_prompt_width = T_full - teacher_logprobs.shape[1]
+            if student_prompt_width > 0:
+                teacher_logprobs = F.pad(teacher_logprobs, (0, 0, student_prompt_width, 0))
+                teacher_ids = F.pad(teacher_ids, (0, 0, student_prompt_width, 0))
+            out["teacher_logprobs"] = teacher_logprobs
+            out["teacher_ids"] = teacher_ids
+
+        return DataProto.from_tensordict(tu.get_tensordict(out))
+
+    def _maybe_update_self_distill_teacher(self, batch: DataProto) -> dict:
+        """OPSD: dispatch the teacher (ref) weight update according to
+        ``distillation.self_distill.teacher_update``.
+
+        Returns a metrics dict (may be empty) reporting whether the update
+        fired and, for ``trust_region``, the observed student/teacher KL.
+        """
+        sd_cfg = self.distillation_config.self_distill
+        strategy = sd_cfg.teacher_update
+        metrics: dict = {}
+
+        if strategy == "ref":
+            return metrics  # frozen teacher; nothing to do.
+
+        triggered = False
+        rpc_kwargs: dict = {}
+
+        if strategy == "ema":
+            decay = (
+                1.0 - sd_cfg.teacher_update_rate
+                if sd_cfg.teacher_update_rate > 0.0
+                else sd_cfg.ema_decay
+            )
+            rpc_kwargs = {"strategy": "ema", "decay": float(decay)}
+            triggered = True
+        elif strategy == "progressive":
+            interval = max(int(sd_cfg.teacher_update_interval), 1)
+            triggered = (self.global_steps % interval == 0)
+            rpc_kwargs = {"strategy": "progressive", "decay": 1.0}
+        elif strategy == "trust_region":
+            kl_value = self._compute_self_distill_student_teacher_kl(batch)
+            metrics["self_distill_teacher/student_teacher_kl"] = float(kl_value)
+            triggered = bool(kl_value <= float(sd_cfg.trust_region_threshold))
+            rpc_kwargs = {"strategy": "progressive", "decay": 1.0}
+        else:
+            return metrics
+
+        metrics["self_distill_teacher/updated"] = float(triggered)
+        if triggered:
+            self.actor_rollout_wg.update_ref_from_actor(**rpc_kwargs)
+        return metrics
+
+    @staticmethod
+    def _compute_self_distill_student_teacher_kl(batch: DataProto) -> float:
+        """k1 estimator of KL(student || teacher) on the response tokens."""
+        td = batch.batch
+        if "old_log_probs" not in td:
+            return float("inf")
+        if "teacher_sampled_logprob" in td:
+            teacher = td["teacher_sampled_logprob"].float()
+        elif "teacher_logprobs" in td:
+            teacher = td["teacher_logprobs"].squeeze(-1).float()
+        else:
+            return float("inf")
+        student = td["old_log_probs"].float()
+        resp_mask = td.get("response_mask")
+        if resp_mask is None:
+            attn = td["attention_mask"].float()
+            resp_len = student.shape[-1]
+            resp_mask = attn[:, -resp_len:]
+        resp_mask = resp_mask.float()
+        sd_mask = td.get("self_distillation_mask")
+        if sd_mask is not None:
+            resp_mask = resp_mask * sd_mask.view(-1, 1).float().to(resp_mask.device)
+        diff = (student - teacher) * resp_mask
+        denom = resp_mask.sum().clamp_min(1.0)
+        return (diff.sum() / denom).item()
 
     def _compute_old_log_prob(self, batch: DataProto):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
@@ -1529,6 +1769,12 @@ class RayPPOTrainer:
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    # OPSD: build teacher prompt and compute teacher logprobs colocated with the actor.
+                    if self.use_self_distillation:
+                        with marked_timer("self_distill_teacher", timing_raw, color="purple"):
+                            teacher_lp = self._compute_self_distill_teacher_log_prob(batch)
+                            batch = batch.union(teacher_lp)
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1597,6 +1843,13 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+
+                        # OPSD teacher update: refresh the colocated ref policy from the actor.
+                        if self.use_self_distillation:
+                            with marked_timer("self_distill_teacher_update", timing_raw, color="purple"):
+                                sd_metrics = self._maybe_update_self_distill_teacher(batch)
+                            if sd_metrics:
+                                metrics.update(sd_metrics)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
