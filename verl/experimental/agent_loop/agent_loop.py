@@ -398,8 +398,16 @@ class AgentLoopWorker:
         self.processor = self.model_config.processor
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
 
-        # Online policy distillation
-        self.distillation_enabled = is_distillation_enabled(config.distillation)
+        # Online policy distillation. Only the "external" mode runs teacher
+        # inference inside the agent loop; OPSD (mode="self") computes teacher
+        # logprobs colocated with the actor in ray_trainer, with no external
+        # teacher cluster, so we must not try to bind a teacher client here.
+        distill_mode = (
+            str(config.distillation.get("mode", "external"))
+            if is_distillation_enabled(config.distillation)
+            else None
+        )
+        self.distillation_enabled = distill_mode == "external"
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 

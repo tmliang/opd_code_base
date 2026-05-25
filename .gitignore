@@ -131,3 +131,19 @@ logs
 log
 outputs
 .history
+# ---- local heavy artifacts (added for personal fork) ----
+/data/
+/Qwen/
+/vllm_src/
+/swanlog/
+/tensorboard_log/
+/verl.egg-info/
+/checkpoints/
+/=*
+
+# ---- local IDE / agent configs (private) ----
+/.claude/
+/.codex/
+/.gemini/
+/.agent/
+/.vscode/

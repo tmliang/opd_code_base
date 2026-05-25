@@ -136,8 +136,15 @@ class TaskRunner:
         if lora_rank <= 0:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        # Self-distillation (OPSD) always needs the ref policy colocated with the actor,
+        # even when the standard PPO ref-policy heuristics would say it is unnecessary.
+        distill_cfg = config.get("distillation")
+        self_distillation = bool(
+            is_distillation_enabled(distill_cfg) and distill_cfg.get("mode", "external") == "self"
+        )
+        needs_ref = need_reference_policy(config) or self_distillation
         # Ref policy is fused into ActorRolloutRefWorker unless LoRA is used with a dedicated ref model.
-        if need_reference_policy(config) and not ref_in_actor:
+        if needs_ref and not ref_in_actor:
             role = Role.ActorRolloutRef
         else:
             role = Role.ActorRollout
@@ -177,13 +184,15 @@ class TaskRunner:
 
         distillation_config = config.get("distillation")
         if is_distillation_enabled(distillation_config):
-            if distillation_config.n_gpus_per_node <= 0:
-                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
-            if distillation_config.nnodes <= 0:
-                raise ValueError("config.distillation.nnodes must be greater than 0")
+            # OPSD (mode='self') colocates the teacher with the actor: no extra pool.
+            if distillation_config.get("mode", "external") != "self":
+                if distillation_config.n_gpus_per_node <= 0:
+                    raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+                if distillation_config.nnodes <= 0:
+                    raise ValueError("config.distillation.nnodes must be greater than 0")
 
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
+                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
@@ -206,7 +215,8 @@ class TaskRunner:
         """Add teacher model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if is_distillation_enabled(config.get("distillation")):
+        distill = config.get("distillation")
+        if is_distillation_enabled(distill) and distill.get("mode", "external") != "self":
             # we do not use teacher model workers, so we only register teacher model in resource pool
             # without registering a teacher model worker in role-worker mapping
             self.mapping[Role.TeacherModel] = "teacher_pool"

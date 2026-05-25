@@ -646,6 +646,65 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_ref_from_actor(self, strategy: str, decay: float = 0.999) -> None:
+        """OPSD teacher update: overwrite ref weights from actor weights.
+
+        Both ``self.actor`` and ``self.ref`` are colocated TrainingWorkers wrapping
+        the same model architecture with identical sharding (same world size,
+        same engine backend), so we can mix the per-rank shards directly.
+
+        Args:
+            strategy:
+              - ``"progressive"``: hard copy ``ref ← actor``.
+              - ``"ema"``: ``ref ← decay * ref + (1 - decay) * actor``.
+            decay: EMA decay (ignored for ``progressive``).
+        """
+        if not (self._is_actor and self._is_ref):
+            return
+        if self.actor is None or self.ref is None:
+            return
+        if strategy not in ("ema", "progressive"):
+            raise ValueError(f"update_ref_from_actor: unsupported strategy {strategy!r}.")
+
+        # Lazy import — only available on FSDP backend.
+        from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+
+        actor_module = self.actor.engine.module
+        ref_module = self.ref.engine.module
+
+        actor_offloaded = bool(getattr(self.actor.engine, "is_param_offload_enabled", False))
+        ref_offloaded = bool(getattr(self.ref.engine, "is_param_offload_enabled", False))
+        if actor_offloaded:
+            load_fsdp_model_to_gpu(actor_module)
+        if ref_offloaded:
+            load_fsdp_model_to_gpu(ref_module)
+
+        try:
+            with torch.no_grad():
+                actor_params = dict(actor_module.named_parameters())
+                for name, ref_param in ref_module.named_parameters():
+                    actor_param = actor_params.get(name)
+                    if actor_param is None:
+                        # Shouldn't happen for matching modules; skip defensively.
+                        continue
+                    if actor_param.shape != ref_param.shape:
+                        raise RuntimeError(
+                            f"update_ref_from_actor: shape mismatch on {name}: "
+                            f"actor {tuple(actor_param.shape)} vs ref {tuple(ref_param.shape)}."
+                        )
+                    src = actor_param.data.to(ref_param.data.device, non_blocking=True)
+                    if strategy == "progressive":
+                        ref_param.data.copy_(src)
+                    else:  # ema
+                        ref_param.data.mul_(decay).add_(src, alpha=1.0 - decay)
+        finally:
+            if ref_offloaded:
+                offload_fsdp_model_to_cpu(ref_module)
+            if actor_offloaded:
+                offload_fsdp_model_to_cpu(actor_module)
+            aggressive_empty_cache(force_sync=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)

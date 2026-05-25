@@ -829,6 +829,7 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  mode: external
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
@@ -842,6 +843,13 @@ distillation:
     clip_ratio: 0.2
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
+    kl_family: verl
+    sdpo:
+      _target_: verl.workers.config.SDPODistillationLossConfig
+      alpha: 1.0
+      mode: topk
+      tail: add
+      ratio_clip: null
   n_gpus_per_node: 8
   nnodes: 0
   teacher_models:
@@ -875,6 +883,16 @@ distillation:
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
         temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
   teacher_key: data_source
+  self_distill:
+    _target_: verl.workers.config.SelfDistillationConfig
+    teacher_update: ema
+    ema_decay: 0.999
+    teacher_update_rate: 0.0
+    teacher_update_interval: 0
+    trust_region_threshold: 0.0
+    truncation: right
+    dataloader: null
+    dataloader_kwargs: {}
 trainer:
   balance_batch: true
   total_epochs: 30
