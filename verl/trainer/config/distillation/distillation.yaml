@@ -175,3 +175,13 @@ self_distill:
   # Forwarded as **kwargs to the dataloader's __init__. tokenizer/processor
   # are injected by the framework.
   dataloader_kwargs: {}
+
+  # Optional directory for debugging OPSD sample processing. Each step writes
+  # one <global_step>.jsonl file; each line contains one rollout sample with
+  # student prompt/response, teacher prompt, skip mask, reward info, and
+  # teacher_first_100 / student_first_100 response-token logprobs.
+  # Disabled when null.
+  sample_dump_path: null
+
+  # Maximum samples to dump per training step. 0 means dump the full batch.
+  sample_dump_max_per_step: 0

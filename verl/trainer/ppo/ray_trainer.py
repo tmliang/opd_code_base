@@ -456,6 +456,48 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, np.ndarray):
+            return RayPPOTrainer._json_safe(value.tolist())
+        if isinstance(value, np.generic):
+            return value.item()
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
+            if value.numel() == 1:
+                return value.item()
+            return RayPPOTrainer._json_safe(value.tolist())
+        if isinstance(value, dict):
+            return {str(k): RayPPOTrainer._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [RayPPOTrainer._json_safe(v) for v in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _write_jsonl_entries(entries, dump_path):
+        """Write pre-built JSONL entries (runs in background thread)."""
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        with open(dump_path, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+    def _dump_jsonl_entries(self, entries, dump_path):
+        if not entries:
+            return
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+        future = self._dump_executor.submit(self._write_jsonl_entries, entries, dump_path)
+        self._dump_futures.append(future)
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL asynchronously."""
         global_steps = self.global_steps
@@ -1272,7 +1314,135 @@ class RayPPOTrainer:
             truncation=sd_cfg.truncation,
         )
 
-    def _compute_self_distill_teacher_log_prob(self, batch: DataProto) -> DataProto:
+    def _resolve_self_distill_sample_dump_dir(self) -> Optional[str]:
+        path = getattr(self.distillation_config.self_distill, "sample_dump_path", None)
+        if not path:
+            return None
+        return os.path.expanduser(str(path))
+
+    def _decode_rows(self, ids: torch.Tensor, masks: Optional[torch.Tensor], n: int) -> list[str]:
+        rows = []
+        for i in range(n):
+            row = ids[i]
+            if masks is not None:
+                row = row[masks[i].bool()]
+            rows.append(self.tokenizer.decode(row, skip_special_tokens=False))
+        return rows
+
+    def _build_first_100_logprobs(
+        self,
+        *,
+        batch: DataProto,
+        sample_index: int,
+        response_mask: torch.Tensor,
+        sampled_lp: torch.Tensor,
+        limit: int = 100,
+    ) -> tuple[list[dict], list[dict]]:
+        valid_positions = torch.nonzero(response_mask.detach().bool(), as_tuple=False).flatten()
+        valid_positions = valid_positions[:limit].detach().cpu().tolist()
+        response_ids = batch.batch["responses"][sample_index].detach().cpu()
+        old_log_probs = batch.batch.get("old_log_probs")
+
+        student_first_100 = []
+        teacher_first_100 = []
+        for trace_index, pos in enumerate(valid_positions):
+            student_token_id = int(response_ids[pos].item())
+            student_logprob = None
+            if old_log_probs is not None:
+                student_logprob = float(old_log_probs[sample_index, pos].detach().float().cpu().item())
+            teacher_sampled_logprob = float(sampled_lp[sample_index, pos].detach().float().cpu().item())
+            token = self.tokenizer.decode([student_token_id], skip_special_tokens=False)
+            base = {
+                "trace_index": int(trace_index),
+                "response_position": int(pos),
+                "token_id": student_token_id,
+                "token": token,
+            }
+            student_first_100.append({**base, "logprob": student_logprob})
+            teacher_first_100.append({**base, "logprob": teacher_sampled_logprob})
+        return teacher_first_100, student_first_100
+
+    def _maybe_dump_self_distill_samples(
+        self,
+        *,
+        batch: DataProto,
+        teacher_batch: DataProto,
+        sampled_lp: torch.Tensor,
+        reward_tensor: Optional[torch.Tensor],
+        reward_extra_infos_dict: Optional[dict],
+    ) -> None:
+        dump_dir = self._resolve_self_distill_sample_dump_dir()
+        if dump_dir is None:
+            return
+        dump_path = os.path.join(dump_dir, f"{int(self.global_steps)}.jsonl")
+
+        n = batch.batch.batch_size[0]
+        max_per_step = int(getattr(self.distillation_config.self_distill, "sample_dump_max_per_step", 0))
+        if max_per_step > 0:
+            n = min(n, max_per_step)
+
+        response_mask = batch.batch.get("response_mask")
+        if response_mask is None:
+            response_mask = compute_response_mask(batch)
+        prompt_mask = batch.batch["attention_mask"][:, : batch.batch["prompts"].shape[1]]
+        student_prompts = self._decode_rows(batch.batch["prompts"], prompt_mask, n)
+        student_responses = self._decode_rows(batch.batch["responses"], response_mask, n)
+        teacher_prompts = self._decode_rows(
+            teacher_batch.batch["teacher_input_ids"], teacher_batch.batch["teacher_attention_mask"], n
+        )
+        teacher_full_inputs = self._decode_rows(
+            teacher_batch.batch["teacher_full_input_ids"], teacher_batch.batch["teacher_full_attention_mask"], n
+        )
+        rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist() if reward_tensor is not None else None
+        sd_mask = teacher_batch.batch["self_distillation_mask"].detach().cpu().tolist()
+
+        reward_extra_infos_dict = reward_extra_infos_dict or {}
+        entries = []
+        for i in range(n):
+            mask_i = response_mask[i].bool()
+            non_tensor = {}
+            for key in ("uid", "data_source", "extra_info", "reward_model", "request_id"):
+                values = batch.non_tensor_batch.get(key)
+                if values is not None and i < len(values):
+                    non_tensor[key] = self._json_safe(values[i])
+
+            reward_extra = {}
+            for key, values in reward_extra_infos_dict.items():
+                if values is not None and i < len(values):
+                    reward_extra[key] = self._json_safe(values[i])
+
+            entry = {
+                "step": int(self.global_steps),
+                "sample_index": int(i),
+                "self_distillation_enabled": bool(sd_mask[i]),
+                "reward": None if rewards is None else rewards[i],
+                "student_prompt": student_prompts[i],
+                "student_response": student_responses[i],
+                "teacher_prompt": teacher_prompts[i],
+                "teacher_full_input": teacher_full_inputs[i],
+                "student_response_token_count": int(mask_i.long().sum().item()),
+                "non_tensor": non_tensor,
+                "reward_extra": reward_extra,
+            }
+            teacher_first_100, student_first_100 = self._build_first_100_logprobs(
+                batch=batch,
+                sample_index=i,
+                response_mask=mask_i,
+                sampled_lp=sampled_lp,
+                limit=100,
+            )
+            entry["teacher_first_100"] = teacher_first_100
+            entry["student_first_100"] = student_first_100
+            entries.append(entry)
+
+        self._dump_jsonl_entries(entries, dump_path)
+
+    def _compute_self_distill_teacher_log_prob(
+        self,
+        batch: DataProto,
+        reward_tensor: Optional[torch.Tensor] = None,
+        reward_extra_infos_dict: Optional[dict] = None,
+    ) -> DataProto:
         """OPSD: forward the reference policy on the teacher prompt + student response.
 
         Sampled-token path (default): writes ``teacher_logprobs`` (B, T_resp, 1)
@@ -1326,6 +1496,14 @@ class RayPPOTrainer:
         ref_view.meta_info = dict(batch.meta_info)
         ref_out = self._compute_ref_log_prob(ref_view, teacher_topk_request=topk_k)
         sampled_lp = ref_out.batch["ref_log_prob"].float()  # (B, T_resp)
+
+        self._maybe_dump_self_distill_samples(
+            batch=batch,
+            teacher_batch=teacher_batch,
+            sampled_lp=sampled_lp,
+            reward_tensor=reward_tensor,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+        )
 
         sd_mask = teacher_batch.batch["self_distillation_mask"]
         out: dict = {"self_distillation_mask": sd_mask}
@@ -1772,7 +1950,11 @@ class RayPPOTrainer:
                     # OPSD: build teacher prompt and compute teacher logprobs colocated with the actor.
                     if self.use_self_distillation:
                         with marked_timer("self_distill_teacher", timing_raw, color="purple"):
-                            teacher_lp = self._compute_self_distill_teacher_log_prob(batch)
+                            teacher_lp = self._compute_self_distill_teacher_log_prob(
+                                batch,
+                                reward_tensor=reward_tensor,
+                                reward_extra_infos_dict=reward_extra_infos_dict,
+                            )
                             batch = batch.union(teacher_lp)
 
                     # compute values

@@ -488,6 +488,13 @@ class SelfDistillationConfig(BaseConfig):
     truncation (str):
         Truncation strategy when the teacher prompt exceeds
         ``data.max_prompt_length``: ``"left"`` / ``"right"`` / ``"error"``.
+    sample_dump_path (str, optional):
+        Directory for debugging per-sample OPSD inputs/outputs. Each step is
+        written as ``<global_step>.jsonl`` with teacher_first_100 /
+        student_first_100 response-token logprobs. Disabled when ``None``.
+    sample_dump_max_per_step (int):
+        Maximum number of samples to dump per training step. ``0`` means dump
+        the full batch.
     """
 
     teacher_update: str = "ema"
@@ -498,6 +505,8 @@ class SelfDistillationConfig(BaseConfig):
     dataloader: Optional[str] = None
     dataloader_kwargs: dict = field(default_factory=dict)
     truncation: str = "right"
+    sample_dump_path: Optional[str] = None
+    sample_dump_max_per_step: int = 0
 
     def validate(self) -> None:
         if self.teacher_update not in {"ref", "ema", "trust_region", "progressive"}:
@@ -527,6 +536,10 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 "OPSD requires distillation.self_distill.dataloader to be set."
             )
+        if self.sample_dump_max_per_step < 0:
+            raise ValueError(
+                "OPSD sample_dump_max_per_step must be >= 0."
+            )
 
     def assert_unused_for_external(self) -> None:
         """Reject OPSD-only overrides when distillation.mode != 'self'.
@@ -555,6 +568,10 @@ class SelfDistillationConfig(BaseConfig):
             offenders.append(f"dataloader={self.dataloader!r}")
         if self.dataloader_kwargs:
             offenders.append(f"dataloader_kwargs={self.dataloader_kwargs!r}")
+        if self.sample_dump_path is not None:
+            offenders.append(f"sample_dump_path={self.sample_dump_path!r}")
+        if self.sample_dump_max_per_step != 0:
+            offenders.append(f"sample_dump_max_per_step={self.sample_dump_max_per_step}")
         if offenders:
             raise ValueError(
                 "distillation.self_distill.* is only supported when "

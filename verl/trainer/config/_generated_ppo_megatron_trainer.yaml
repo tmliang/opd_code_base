@@ -893,6 +893,8 @@ distillation:
     truncation: right
     dataloader: null
     dataloader_kwargs: {}
+    sample_dump_path: null
+    sample_dump_max_per_step: 0
 trainer:
   balance_batch: true
   total_epochs: 30
