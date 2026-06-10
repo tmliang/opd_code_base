@@ -1522,6 +1522,24 @@ class RayPPOTrainer:
         teacher_batch.non_tensor_batch = dict(batch.non_tensor_batch)
         self.self_distillation_runtime.apply(teacher_batch)
 
+        sd_mask = teacher_batch.batch["self_distillation_mask"]
+        if not bool(sd_mask.any()):
+            # Every sample was skipped by the teacher dataloader — the loss is
+            # fully masked, so skip the (expensive) ref forward entirely.
+            print(
+                f"OPSD: all {sd_mask.numel()} samples skipped by the teacher dataloader "
+                f"this step; skipping the teacher ref forward."
+            )
+            B = sd_mask.shape[0]
+            T_full = batch.batch["attention_mask"].shape[1]
+            T_resp = batch.batch["responses"].shape[1]
+            out_skip: dict = {"self_distillation_mask": sd_mask}
+            k_dim = topk_k if use_topk else 1
+            out_skip["teacher_logprobs"] = torch.zeros(B, T_full, k_dim, dtype=torch.float32)
+            out_skip["teacher_ids"] = torch.zeros(B, T_full, k_dim, dtype=torch.long)
+            out_skip["teacher_sampled_logprob"] = torch.zeros(B, T_resp, dtype=torch.float32)
+            return DataProto.from_tensordict(tu.get_tensordict(out_skip))
+
         # 2) swap student prompt fields with the teacher's; `responses` unchanged
         td = teacher_batch.batch
         td["input_ids"] = td["teacher_full_input_ids"]
@@ -1558,7 +1576,6 @@ class RayPPOTrainer:
             reward_extra_infos_dict=reward_extra_infos_dict,
         )
 
-        sd_mask = teacher_batch.batch["self_distillation_mask"]
         out: dict = {"self_distillation_mask": sd_mask}
 
         if use_topk:
@@ -1607,6 +1624,10 @@ class RayPPOTrainer:
             teacher_ids = F.pad(teacher_ids, (0, 0, student_prompt_width - 1, 1))
             out["teacher_logprobs"] = teacher_logprobs
             out["teacher_ids"] = teacher_ids
+            # Unpadded (B, T_resp) copy for the trust-region student/teacher KL
+            # metric — the padded ``teacher_logprobs`` above is offset by
+            # prompt_width-1 and cannot be subtracted from old_log_probs as-is.
+            out["teacher_sampled_logprob"] = sampled_lp
 
         return DataProto.from_tensordict(tu.get_tensordict(out))
 
@@ -1665,6 +1686,14 @@ class RayPPOTrainer:
         else:
             return float("inf")
         student = td["old_log_probs"].float()
+        if teacher.dim() != student.dim() or teacher.shape[-1] != student.shape[-1]:
+            # ``teacher_logprobs`` is padded to the full student sequence with a
+            # left offset of prompt_width-1 (logits position that predicts each
+            # response token); slice the response-aligned window back out.
+            T_resp = student.shape[-1]
+            if teacher.dim() != 2 or teacher.shape[-1] < T_resp + 1:
+                return float("inf")
+            teacher = teacher[:, -(T_resp + 1) : -1]
         resp_mask = td.get("response_mask")
         if resp_mask is None:
             attn = td["attention_mask"].float()

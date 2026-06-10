@@ -1,12 +1,12 @@
 # OPSD：On-Policy Self-Distillation
 
-本目录收录了 OPSD（On-Policy Self-Distillation）相关的可直接运行配方：
+本目录收录了 OPSD（On-Policy Self-Distillation）相关的可直接运行配方（位于 [`examples/on_policy_self_distillation_trainer/`](examples/on_policy_self_distillation_trainer/)）：
 
-- [`run_qwen_opsd.sh`](./run_qwen_opsd.sh)：原始 OPSD 论文复现
-- [`run_qwen_sdpo.sh`](./run_qwen_sdpo.sh)：SDPO（EMA teacher + alpha-KL）
-- [`run_qwen_vision_opd.sh`](./run_qwen_vision_opd.sh)：Vision-OPD（多模态图像 prompt 改写）
-- [`teacher_dataloader/`](./teacher_dataloader/)：上述三个配方对应的 teacher dataloader 实现
-- [`vision_opd_reward.py`](./vision_opd_reward.py)：Vision-OPD 用的 V\*Bench multi-choice reward function
+- [`run_qwen_opsd.sh`](examples/on_policy_self_distillation_trainer/run_qwen_opsd.sh)：原始 OPSD 论文复现
+- [`run_qwen_sdpo.sh`](examples/on_policy_self_distillation_trainer/run_qwen_sdpo.sh)：SDPO（EMA teacher + alpha-KL）
+- [`run_qwen_vision_opd.sh`](examples/on_policy_self_distillation_trainer/run_qwen_vision_opd.sh)：Vision-OPD（多模态图像 prompt 改写）
+- [`run_qwen_video_opd.sh`](examples/on_policy_self_distillation_trainer/run_qwen_video_opd.sh)：Video-OPD（teacher 以答案时间区间为中心非均匀采帧）
+- [`verl/workers/self_distillation/dataloaders/`](verl/workers/self_distillation/dataloaders/)：上述配方对应的内置 teacher dataloader 实现（注册名 `opsd` / `sdpo` / `vision_opd` / `video_opd`）
 
 OPSD 让 student **以自身为教师**进行 on-policy 蒸馏——不需要额外的教师模型、不需要额外的显存。教师信号通过**重写 prompt**（注入 gold answer、加 few-shot 示范、加 hint 等）从同一个模型激发出来。
 
@@ -114,19 +114,29 @@ distillation.distillation_loss.use_policy_gradient=False
 
 就这三条加上你已有的 PPO/GRPO 启动命令即可。**不需要**配 `distillation.teacher_models / n_gpus_per_node / nnodes`——OPSD 完全复用 colocated 的 ref policy。
 
-完整脚本（通用 OPSD 模板）：[`../on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh`](../on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh)。
+完整脚本（通用 OPSD 模板）：[`examples/on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh`](examples/on_policy_distillation_trainer/run_qwen3_8b_opsd_fsdp.sh)。
 
-如果你想直接跑仓库里已经对齐过当前实现的配方，优先看本目录下的三个脚本：[`run_qwen_opsd.sh`](./run_qwen_opsd.sh) / [`run_qwen_sdpo.sh`](./run_qwen_sdpo.sh) / [`run_qwen_vision_opd.sh`](./run_qwen_vision_opd.sh)。
+如果你想直接跑仓库里已经对齐过当前实现的配方，优先看 [`examples/on_policy_self_distillation_trainer/`](examples/on_policy_self_distillation_trainer/) 下的三个脚本：[`run_qwen_opsd.sh`](examples/on_policy_self_distillation_trainer/run_qwen_opsd.sh) / [`run_qwen_sdpo.sh`](examples/on_policy_self_distillation_trainer/run_qwen_sdpo.sh) / [`run_qwen_vision_opd.sh`](examples/on_policy_self_distillation_trainer/run_qwen_vision_opd.sh)。
 
 ### Step 3：三个具体例子
 
-下面三个示例展示了同一套 OPSD 框架如何覆盖 OPSD / SDPO / Vision-OPD。对应的可直接运行的 teacher dataloader 示例放在 [`./teacher_dataloader/`](./teacher_dataloader/)。
+下面三个示例展示了同一套 OPSD 框架如何覆盖 OPSD / SDPO / Vision-OPD。对应实现是内置 dataloader（[`verl/workers/self_distillation/dataloaders/`](verl/workers/self_distillation/dataloaders/)，注册名 `opsd` / `sdpo` / `vision_opd`）。
 
 | 配方 | 启动脚本 | teacher 注入 | loss | teacher 更新 |
 |---|---|---|---|---|
-| **OPSD**（原 paper 复现） | [run_qwen_opsd.sh](./run_qwen_opsd.sh) | 把 `extra_info.{solution,reference_solution,answer}` 中的参考解答重写进最后一条 user turn | `kl_family=sdpo, sdpo.alpha=0.0, sdpo.mode=topk, sdpo.tail=renorm, topk=128, loss_max_clamp=0.05` | `ref` 固定 |
-| **SDPO** | [run_qwen_sdpo.sh](./run_qwen_sdpo.sh) | 把同一 UID 下 reward 足够高的 sibling rollout 作为 reprompt 示范拼回 prompt | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
-| **Vision-OPD** | [run_qwen_vision_opd.sh](./run_qwen_vision_opd.sh) | teacher 侧复用原始文本 prompt，但把图像替换成 `extra_info.bbox_images` 指向的 bbox 版本 | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+| **OPSD**（原 paper 复现） | [run_qwen_opsd.sh](examples/on_policy_self_distillation_trainer/run_qwen_opsd.sh) | 把 `extra_info.{solution,reference_solution,answer}` 中的参考解答重写进最后一条 user turn（dataloader=`opsd`） | `kl_family=sdpo, sdpo.alpha=0.0, sdpo.mode=topk, sdpo.tail=renorm, topk=128, loss_max_clamp=0.05` | `ref` 固定 |
+| **SDPO** | [run_qwen_sdpo.sh](examples/on_policy_self_distillation_trainer/run_qwen_sdpo.sh) | 脚本当前为 ground-truth reprompt 变体（dataloader=`opsd`，`rollout.n=1`）；如需原始 SDPO 的 sibling 示范，请改用 dataloader=`sdpo` 并将 `rollout.n>1` | `kl_family=sdpo, sdpo.alpha=1.0, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+| **Vision-OPD** | [run_qwen_vision_opd.sh](examples/on_policy_self_distillation_trainer/run_qwen_vision_opd.sh) | teacher 侧复用原始文本 prompt，但把图像替换成 `extra_info.bbox_images` 指向的 bbox 版本（dataloader=`vision_opd`） | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+| **Video-OPD** | [run_qwen_video_opd.sh](examples/on_policy_self_distillation_trainer/run_qwen_video_opd.sh) | teacher 侧复用原始文本 prompt，但视频按 `extra_info.time_reference` 答案区间重新非均匀采帧（dataloader=`video_opd`；student 仍均匀采帧） | `kl_family=sdpo, sdpo.alpha=0.5, sdpo.mode=topk, sdpo.tail=add, sdpo.ratio_clip=2.0` | `ema`, `teacher_update_rate=0.05` |
+
+**Video-OPD 数据要求与参数**（`self_distill.dataloader_kwargs`）：
+
+- 数据行需要 `extra_info.time_reference`（答案所在时间区间，秒），支持 `[start, end]` / `{"start": s, "end": e}` / 单个时间点；视频路径默认从消息里的 `{"type": "video", "video": <path>}` 读取，也可用 `video_path_field` 指定 `extra_info` 字段。
+- `focus_ratio`（float，(0,1]，默认 0.6）：落在（加 margin 后的）参考区间内的帧比例，其余帧在全片均匀分布。
+- `context_margin_sec`（float，默认 2.0）：区间两侧各外扩的秒数。
+- `num_frames`（int，默认 null）：teacher 帧预算；缺省自动对齐 student 的采帧数，使 teacher/student 的 video token 数一致。
+- `time_reference_field` / `video_path_field`（str）：字段名覆盖。
+- 缺失 `time_reference` 或视频解码失败的样本会自动 `skip`（该条蒸馏 loss 被 mask，不影响 RL 部分）。解码优先用 `decord`，回退 `torchvision`。
 
 ### Step 4：常用组合速查
 
@@ -157,6 +167,7 @@ ref policy forward → teacher_logprobs
 关键点：
 - Student 和 teacher 共用同一个进程、同一份 FSDP shard、同一个 tokenizer/processor。
 - "教师"的本质只是**一次 prompt 不同的 ref forward**，因此 OPSD 没有任何额外 GPU 开销。
+- Offline dataloader 的 `build_one` + tokenize/多模态处理会按 `uid` 自动去重：`rollout.n > 1` 时同一 prompt 的 n 个副本只构建一次 teacher prompt（对 Vision-OPD/Video-OPD 这种重多模态处理的配方提速明显）。
 - 教师权重可以静态固定（`ref`），也可以让它跟着 student 走（`ema`/`progressive`/`trust_region`）。
 
 ---

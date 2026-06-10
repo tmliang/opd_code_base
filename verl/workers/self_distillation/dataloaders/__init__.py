@@ -45,3 +45,4 @@ def names() -> list[str]:
 from . import opsd_dataloader as _opsd  # noqa: E402,F401
 from . import sdpo_dataloader as _sdpo  # noqa: E402,F401
 from . import vision_opd_dataloader as _vision  # noqa: E402,F401
+from . import video_opd_dataloader as _video  # noqa: E402,F401

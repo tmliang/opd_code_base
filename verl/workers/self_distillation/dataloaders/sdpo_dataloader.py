@@ -87,9 +87,12 @@ class sdpo_dataloader(OnlineTeacherDataloader):  # noqa: N801 (lowercase per use
             return None
 
         self_success = reward is not None and reward >= self._success_threshold
+        # Documented semantics: when the sample itself already succeeded and
+        # ``dont_reprompt_on_self_success`` is set, do not reprompt it at all
+        # (neither with a sibling demo nor with its own response).
+        if self._dont_reprompt_on_self_success and self_success:
+            return None
         for j in batch_view.iter_same_uid(index):
-            if self._dont_reprompt_on_self_success and j == index:
-                continue
             rj = rewards[j] if j < len(rewards) else None
             if rj is None or rj < self._success_threshold:
                 continue
@@ -101,7 +104,7 @@ class sdpo_dataloader(OnlineTeacherDataloader):  # noqa: N801 (lowercase per use
         # Fall back to self if it succeeded (matches upstream ``solution_idxs``
         # building, which includes the current sample unless
         # ``dont_reprompt_on_self_success`` is set).
-        if self_success and not self._dont_reprompt_on_self_success:
+        if self_success:
             demo = responses[index] if index < len(responses) else None
             if demo:
                 return self._strip_think_tags(demo) if self._strip_thinking else demo

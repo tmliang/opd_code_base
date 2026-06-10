@@ -152,8 +152,13 @@ class SelfDistillationRuntime:
 
         view = self._build_batch_view(batch, n) if self.is_online else None
 
-        teacher_samples: list[TeacherSample] = [self._call_dataloader(batch, i, view) for i in range(n)]
-        skip_flags = [s.skip for s in teacher_samples]
+        # One batched decode instead of n per-sample decodes (prompt_text is a
+        # debugging aid handed to ``build_one``).
+        prompt_texts = self.tokenizer.batch_decode(
+            [row[row != self.pad_token_id] for row in prompt_ids], skip_special_tokens=False
+        )
+
+        skip_flags = [False] * n
 
         prompt_ids_list: list[torch.Tensor] = []
         prompt_attn_list: list[torch.Tensor] = []
@@ -162,23 +167,37 @@ class SelfDistillationRuntime:
         student_mm_inputs = batch.non_tensor_batch.get("multi_modal_inputs")
         student_position_ids = batch.batch.get("position_ids")
 
-        for i, sample in enumerate(teacher_samples):
-            if sample.skip or not sample.messages:
-                self._append_student_prompt_fallback(
-                    i,
-                    prompt_ids,
-                    student_position_ids,
-                    student_mm_inputs,
-                    prompt_ids_list,
-                    prompt_attn_list,
-                    prompt_pos_list,
-                    mm_inputs_per_sample,
-                )
-                continue
-            try:
-                tp_ids, attn, mm, pos = self._tokenize_messages(sample)
-            except ValueError as exc:
-                logger.warning("Skipping OPSD sample %s: %s", i, exc)
+        # Offline dedup: ``OfflineTeacherDataloader.build_one`` depends only on
+        # the original dataset row, and with ``rollout.n > 1`` the batch holds
+        # n identical copies of each row (same ``uid``). Build + tokenize the
+        # teacher prompt once per uid and share the resulting (read-only)
+        # tensors across siblings — this also dedups expensive multi-modal
+        # processor calls (Vision-OPD pixel_values, video decoding, ...).
+        uids = batch.non_tensor_batch.get("uid") if self.is_offline else None
+        offline_cache: Optional[dict] = {} if uids is not None else None
+
+        for i in range(n):
+            cache_key = None
+            if offline_cache is not None:
+                try:
+                    cache_key = uids[i] if uids[i] is not None else None
+                    _ = hash(cache_key)
+                except TypeError:
+                    cache_key = None
+            entry = offline_cache.get(cache_key) if cache_key is not None else None
+            if entry is None:
+                sample = self._call_dataloader(batch, i, view, prompt_texts[i])
+                if sample.skip or not sample.messages:
+                    entry = ("skip",)
+                else:
+                    try:
+                        entry = ("ok", *self._tokenize_messages(sample))
+                    except ValueError as exc:
+                        logger.warning("Skipping OPSD sample %s: %s", i, exc)
+                        entry = ("skip",)
+                if cache_key is not None:
+                    offline_cache[cache_key] = entry
+            if entry[0] == "skip":
                 skip_flags[i] = True
                 self._append_student_prompt_fallback(
                     i,
@@ -191,6 +210,7 @@ class SelfDistillationRuntime:
                     mm_inputs_per_sample,
                 )
                 continue
+            _, tp_ids, attn, mm, pos = entry
             prompt_ids_list.append(tp_ids)
             prompt_attn_list.append(attn)
             prompt_pos_list.append(pos)
@@ -285,11 +305,18 @@ class SelfDistillationRuntime:
     def _build_batch_view(self, batch, n: int) -> BatchView:
         uids = list(batch.non_tensor_batch.get("uid", [None] * n))
 
+        # NOTE: key lookup order matters. In ``ray_trainer`` the OPSD teacher
+        # pass runs *before* the adv block writes ``token_level_rewards``;
+        # at that point the sequence reward only exists as ``rm_scores``
+        # (token-level, sum == sequence reward) produced by the rollout /
+        # reward loop.
         rewards = None
-        if "token_level_rewards" in batch.batch:
-            r = batch.batch["token_level_rewards"]
-            rewards = r.sum(dim=-1).tolist() if r.ndim > 1 else r.tolist()
-        elif "reward_score" in batch.batch:
+        for key in ("token_level_rewards", "rm_scores"):
+            if key in batch.batch:
+                r = batch.batch[key]
+                rewards = r.sum(dim=-1).tolist() if r.ndim > 1 else r.tolist()
+                break
+        if rewards is None and "reward_score" in batch.batch:
             rewards = batch.batch["reward_score"].tolist()
 
         response_texts = self.tokenizer.batch_decode(
@@ -303,12 +330,7 @@ class SelfDistillationRuntime:
             extra={k: list(v) for k, v in batch.non_tensor_batch.items()},
         )
 
-    def _call_dataloader(self, batch, i: int, view: Optional[BatchView]) -> TeacherSample:
-        prompt_ids: torch.Tensor = batch.batch["prompts"][i]
-        prompt_text = self.tokenizer.decode(
-            prompt_ids[prompt_ids != self.pad_token_id], skip_special_tokens=False
-        )
-
+    def _call_dataloader(self, batch, i: int, view: Optional[BatchView], prompt_text: str) -> TeacherSample:
         prompt_messages = None
         raw_messages = batch.non_tensor_batch.get("raw_prompt")
         if raw_messages is not None and raw_messages[i] is not None:
@@ -390,7 +412,11 @@ class SelfDistillationRuntime:
             enc = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
             ids = enc["input_ids"][0]
             attn = enc["attention_mask"][0]
-            mm_inputs_out = sample.multi_modal_data
+            # No processor ran in this branch, so there are no processor-output
+            # tensors to forward. Returning the raw ``multi_modal_data`` (PIL
+            # images etc.) here would end up in ``teacher_multi_modal_inputs``
+            # and break the engine's ``extract_multi_modal_inputs`` torch.cat.
+            mm_inputs_out = None
             pos = None
 
         ids, attn = self._maybe_truncate(ids, attn)

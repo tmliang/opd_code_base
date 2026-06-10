@@ -79,14 +79,21 @@ class BatchView:
     rewards: Optional[list[float]] = None
     response_texts: Optional[list[str]] = None
     extra: dict[str, list[Any]] = field(default_factory=dict)
+    _uid_groups: Optional[dict[Any, list[int]]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def iter_same_uid(self, index: int) -> Iterable[int]:
         """Yield indices of all other samples sharing this sample's UID."""
         if not self.uids:
             return
-        target = self.uids[index]
-        for j, u in enumerate(self.uids):
-            if j != index and u == target:
+        if self._uid_groups is None:
+            groups: dict[Any, list[int]] = {}
+            for j, u in enumerate(self.uids):
+                groups.setdefault(u, []).append(j)
+            self._uid_groups = groups
+        for j in self._uid_groups.get(self.uids[index], ()):
+            if j != index:
                 yield j
 
 

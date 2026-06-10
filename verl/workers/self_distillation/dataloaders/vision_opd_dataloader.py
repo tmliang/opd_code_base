@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import threading
@@ -75,7 +74,21 @@ class VisionOPD_dataloader(OfflineTeacherDataloader):  # noqa: N801 (mixed case 
         if not teacher_pils:
             return TeacherSample(messages=[], skip=True)
 
-        messages = copy.deepcopy(prompt_messages)
+        # Structure-copy the messages (dicts/lists one level deep) instead of
+        # ``copy.deepcopy``: the student messages inline PIL images whose pixel
+        # buffers we are about to replace anyway — deep-copying them is pure
+        # waste (and significant for rollout.n > 1).
+        messages = [
+            {
+                **msg,
+                "content": (
+                    [dict(it) if isinstance(it, dict) else it for it in msg["content"]]
+                    if isinstance(msg.get("content"), list)
+                    else msg.get("content")
+                ),
+            }
+            for msg in prompt_messages
+        ]
         image_offset = 0
         for msg in messages:
             content = msg.get("content")
@@ -87,6 +100,10 @@ class VisionOPD_dataloader(OfflineTeacherDataloader):  # noqa: N801 (mixed case 
                         return TeacherSample(messages=[], skip=True)
                     item["image"] = teacher_pils[image_offset]
                     image_offset += 1
+        if image_offset != len(teacher_pils):
+            # More teacher images than image slots in the messages — the
+            # processor would see mismatched text placeholders vs pixels.
+            return TeacherSample(messages=[], skip=True)
 
         mm = dict(multi_modal_data or {})
         # Even when messages carry inlined images, runtime._tokenize_messages
