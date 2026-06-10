@@ -1312,6 +1312,7 @@ class RayPPOTrainer:
             max_prompt_length=int(self.config.data.max_prompt_length),
             pad_token_id=int(pad_token_id),
             truncation=sd_cfg.truncation,
+            mm_processor_kwargs=dict(self.config.data.get("mm_processor_kwargs", {}) or {}),
         )
 
     def _resolve_self_distill_sample_dump_dir(self) -> Optional[str]:
@@ -1320,12 +1321,45 @@ class RayPPOTrainer:
             return None
         return os.path.expanduser(str(path))
 
-    def _decode_rows(self, ids: torch.Tensor, masks: Optional[torch.Tensor], n: int) -> list[str]:
+    def _dump_visual_token_ids(self) -> set[int]:
+        token_ids: set[int] = set()
+        processor = getattr(self, "processor", None)
+        for attr in ("vision_start_token_id", "vision_end_token_id", "image_token_id", "video_token_id"):
+            token_id = getattr(processor, attr, None)
+            if token_id is not None:
+                token_ids.add(int(token_id))
+
+        for token in ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>"):
+            try:
+                token_id = self.tokenizer.convert_tokens_to_ids(token)
+                decoded = self.tokenizer.convert_ids_to_tokens(token_id)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(token_id, int) and decoded == token:
+                token_ids.add(token_id)
+        return token_ids
+
+    def _drop_dump_visual_tokens(self, row: torch.Tensor, skip_token_ids: set[int]) -> torch.Tensor:
+        if not skip_token_ids:
+            return row
+        skip = torch.tensor(list(skip_token_ids), dtype=row.dtype, device=row.device)
+        return row[~torch.isin(row, skip)]
+
+    def _decode_rows(
+        self,
+        ids: torch.Tensor,
+        masks: Optional[torch.Tensor],
+        n: int,
+        *,
+        skip_visual_tokens: bool = False,
+    ) -> list[str]:
+        skip_token_ids = self._dump_visual_token_ids() if skip_visual_tokens else set()
         rows = []
         for i in range(n):
             row = ids[i]
             if masks is not None:
                 row = row[masks[i].bool()]
+            row = self._drop_dump_visual_tokens(row, skip_token_ids)
             rows.append(self.tokenizer.decode(row, skip_special_tokens=False))
         return rows
 
@@ -1337,30 +1371,45 @@ class RayPPOTrainer:
         response_mask: torch.Tensor,
         sampled_lp: torch.Tensor,
         limit: int = 100,
-    ) -> tuple[list[dict], list[dict]]:
-        valid_positions = torch.nonzero(response_mask.detach().bool(), as_tuple=False).flatten()
-        valid_positions = valid_positions[:limit].detach().cpu().tolist()
+    ) -> list[dict]:
+        valid_positions = (
+            torch.nonzero(response_mask.detach().bool(), as_tuple=False).flatten().detach().cpu().tolist()
+        )
         response_ids = batch.batch["responses"][sample_index].detach().cpu()
         old_log_probs = batch.batch.get("old_log_probs")
+        skip_token_ids = self._dump_visual_token_ids()
 
-        student_first_100 = []
-        teacher_first_100 = []
-        for trace_index, pos in enumerate(valid_positions):
+        first_100 = []
+        for pos in valid_positions:
             student_token_id = int(response_ids[pos].item())
+            if student_token_id in skip_token_ids:
+                continue
+            trace_index = len(first_100)
             student_logprob = None
             if old_log_probs is not None:
                 student_logprob = float(old_log_probs[sample_index, pos].detach().float().cpu().item())
             teacher_sampled_logprob = float(sampled_lp[sample_index, pos].detach().float().cpu().item())
+            logprob_delta = None
+            abs_logprob_delta = None
+            if student_logprob is not None:
+                logprob_delta = student_logprob - teacher_sampled_logprob
+                abs_logprob_delta = abs(logprob_delta)
             token = self.tokenizer.decode([student_token_id], skip_special_tokens=False)
-            base = {
-                "trace_index": int(trace_index),
-                "response_position": int(pos),
-                "token_id": student_token_id,
-                "token": token,
-            }
-            student_first_100.append({**base, "logprob": student_logprob})
-            teacher_first_100.append({**base, "logprob": teacher_sampled_logprob})
-        return teacher_first_100, student_first_100
+            first_100.append(
+                {
+                    "trace_index": int(trace_index),
+                    "response_position": int(pos),
+                    "token_id": student_token_id,
+                    "token": token,
+                    "student_logprob": student_logprob,
+                    "teacher_logprob": teacher_sampled_logprob,
+                    "logprob_delta": logprob_delta,
+                    "abs_logprob_delta": abs_logprob_delta,
+                }
+            )
+            if len(first_100) >= limit:
+                break
+        return first_100
 
     def _maybe_dump_self_distill_samples(
         self,
@@ -1385,13 +1434,19 @@ class RayPPOTrainer:
         if response_mask is None:
             response_mask = compute_response_mask(batch)
         prompt_mask = batch.batch["attention_mask"][:, : batch.batch["prompts"].shape[1]]
-        student_prompts = self._decode_rows(batch.batch["prompts"], prompt_mask, n)
+        student_prompts = self._decode_rows(batch.batch["prompts"], prompt_mask, n, skip_visual_tokens=True)
         student_responses = self._decode_rows(batch.batch["responses"], response_mask, n)
         teacher_prompts = self._decode_rows(
-            teacher_batch.batch["teacher_input_ids"], teacher_batch.batch["teacher_attention_mask"], n
+            teacher_batch.batch["teacher_input_ids"],
+            teacher_batch.batch["teacher_attention_mask"],
+            n,
+            skip_visual_tokens=True,
         )
         teacher_full_inputs = self._decode_rows(
-            teacher_batch.batch["teacher_full_input_ids"], teacher_batch.batch["teacher_full_attention_mask"], n
+            teacher_batch.batch["teacher_full_input_ids"],
+            teacher_batch.batch["teacher_full_attention_mask"],
+            n,
+            skip_visual_tokens=True,
         )
         rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist() if reward_tensor is not None else None
         sd_mask = teacher_batch.batch["self_distillation_mask"].detach().cpu().tolist()
@@ -1424,15 +1479,13 @@ class RayPPOTrainer:
                 "non_tensor": non_tensor,
                 "reward_extra": reward_extra,
             }
-            teacher_first_100, student_first_100 = self._build_first_100_logprobs(
+            entry["first_100"] = self._build_first_100_logprobs(
                 batch=batch,
                 sample_index=i,
                 response_mask=mask_i,
                 sampled_lp=sampled_lp,
                 limit=100,
             )
-            entry["teacher_first_100"] = teacher_first_100
-            entry["student_first_100"] = student_first_100
             entries.append(entry)
 
         self._dump_jsonl_entries(entries, dump_path)

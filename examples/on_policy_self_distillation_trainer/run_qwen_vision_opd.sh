@@ -33,24 +33,24 @@ nnodes=1
 n_gpus_per_node=8
 
 # ---- batch / sequence ----
-train_batch_size=64
-ppo_mini_batch_size=32
-max_prompt_length=2048
-max_response_length=4096
-ppo_max_token_len_per_gpu=9216
-max_num_batched_tokens=9216
-max_model_len=9216
+train_batch_size=16
+ppo_mini_batch_size=8
+max_prompt_length=5120
+max_response_length=1024
+ppo_max_token_len_per_gpu=7168
+max_num_batched_tokens=7168
+max_model_len=7168
 mm_min_pixels=4096
-mm_max_pixels=131072
+mm_max_pixels=4194304
 
 # ---- optim ----
-actor_lr=2e-6
+actor_lr=1e-6
 lr_warmup_steps=10
 clip_ratio_low=0.2
 clip_ratio_high=0.3
 
 # ---- rollout ----
-rollout_n=1
+rollout_n=4
 rollout_do_sample=True
 rollout_temperature=1.0
 rollout_top_p=0.95

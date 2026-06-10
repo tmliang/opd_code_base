@@ -490,8 +490,8 @@ class SelfDistillationConfig(BaseConfig):
         ``data.max_prompt_length``: ``"left"`` / ``"right"`` / ``"error"``.
     sample_dump_path (str, optional):
         Directory for debugging per-sample OPSD inputs/outputs. Each step is
-        written as ``<global_step>.jsonl`` with teacher_first_100 /
-        student_first_100 response-token logprobs. Disabled when ``None``.
+        written as ``<global_step>.jsonl`` with first_100 response-token
+        student/teacher logprob traces. Disabled when ``None``.
     sample_dump_max_per_step (int):
         Maximum number of samples to dump per training step. ``0`` means dump
         the full batch.

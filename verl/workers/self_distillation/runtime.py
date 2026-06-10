@@ -38,6 +38,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from verl.utils.tokenizer import build_multimodal_processor_inputs
+
 from .teacher_dataloader import (
     BatchView,
     OfflineTeacherDataloader,
@@ -110,6 +112,7 @@ class SelfDistillationRuntime:
         max_prompt_length: int,
         pad_token_id: int,
         truncation: str = "right",
+        mm_processor_kwargs: Optional[dict] = None,
     ):
         self.dataloader = teacher_dataloader
         self.is_online = isinstance(teacher_dataloader, OnlineTeacherDataloader)
@@ -121,6 +124,7 @@ class SelfDistillationRuntime:
             )
         self.tokenizer = tokenizer
         self.processor = processor
+        self.mm_processor_kwargs = dict(mm_processor_kwargs or {})
         self.max_prompt_length = max_prompt_length
         self.pad_token_id = pad_token_id
         if truncation not in {"left", "right", "error"}:
@@ -148,26 +152,45 @@ class SelfDistillationRuntime:
 
         view = self._build_batch_view(batch, n) if self.is_online else None
 
-        teacher_samples: list[TeacherSample] = [
-            self._call_dataloader(batch, i, view) for i in range(n)
-        ]
-        skip_mask = torch.tensor([s.skip for s in teacher_samples], dtype=torch.bool)
+        teacher_samples: list[TeacherSample] = [self._call_dataloader(batch, i, view) for i in range(n)]
+        skip_flags = [s.skip for s in teacher_samples]
 
         prompt_ids_list: list[torch.Tensor] = []
         prompt_attn_list: list[torch.Tensor] = []
         prompt_pos_list: list[Optional[torch.Tensor]] = []
         mm_inputs_per_sample: list[Optional[dict]] = []
+        student_mm_inputs = batch.non_tensor_batch.get("multi_modal_inputs")
+        student_position_ids = batch.batch.get("position_ids")
 
         for i, sample in enumerate(teacher_samples):
             if sample.skip or not sample.messages:
-                tp_ids = self._extract_unpadded_prompt(prompt_ids[i])
-                attn = torch.ones_like(tp_ids, dtype=torch.long)
-                prompt_ids_list.append(tp_ids)
-                prompt_attn_list.append(attn)
-                prompt_pos_list.append(None)
-                mm_inputs_per_sample.append(None)
+                self._append_student_prompt_fallback(
+                    i,
+                    prompt_ids,
+                    student_position_ids,
+                    student_mm_inputs,
+                    prompt_ids_list,
+                    prompt_attn_list,
+                    prompt_pos_list,
+                    mm_inputs_per_sample,
+                )
                 continue
-            tp_ids, attn, mm, pos = self._tokenize_messages(sample)
+            try:
+                tp_ids, attn, mm, pos = self._tokenize_messages(sample)
+            except ValueError as exc:
+                logger.warning("Skipping OPSD sample %s: %s", i, exc)
+                skip_flags[i] = True
+                self._append_student_prompt_fallback(
+                    i,
+                    prompt_ids,
+                    student_position_ids,
+                    student_mm_inputs,
+                    prompt_ids_list,
+                    prompt_attn_list,
+                    prompt_pos_list,
+                    mm_inputs_per_sample,
+                )
+                continue
             prompt_ids_list.append(tp_ids)
             prompt_attn_list.append(attn)
             prompt_pos_list.append(pos)
@@ -200,7 +223,7 @@ class SelfDistillationRuntime:
         batch.batch["teacher_full_input_ids"] = teacher_full_ids
         batch.batch["teacher_full_attention_mask"] = teacher_full_attn
         batch.batch["teacher_full_position_ids"] = teacher_full_position_ids
-        batch.batch["self_distillation_mask"] = ~skip_mask
+        batch.batch["self_distillation_mask"] = ~torch.tensor(skip_flags, dtype=torch.bool)
 
         # Write under the engine-consumed key (``multi_modal_inputs``) on a
         # *teacher_*-prefixed slot so callers can route it explicitly into the
@@ -212,6 +235,50 @@ class SelfDistillationRuntime:
                 [m if m is not None else {} for m in mm_inputs_per_sample],
                 dtype=object,
             )
+
+    def _append_student_prompt_fallback(
+        self,
+        i: int,
+        prompt_ids: torch.Tensor,
+        student_position_ids: Optional[torch.Tensor],
+        student_mm_inputs,
+        prompt_ids_list: list[torch.Tensor],
+        prompt_attn_list: list[torch.Tensor],
+        prompt_pos_list: list[Optional[torch.Tensor]],
+        mm_inputs_per_sample: list[Optional[dict]],
+    ) -> None:
+        tp_ids = self._extract_unpadded_prompt(prompt_ids[i])
+        attn = torch.ones_like(tp_ids, dtype=torch.long)
+        prompt_ids_list.append(tp_ids)
+        prompt_attn_list.append(attn)
+        prompt_pos_list.append(self._extract_unpadded_prompt_position_ids(i, prompt_ids, student_position_ids))
+        if student_mm_inputs is not None and i < len(student_mm_inputs):
+            mm = student_mm_inputs[i]
+            mm = mm.data if hasattr(mm, "data") else mm
+            if mm is not None:
+                mm = dict(mm)
+                mm.pop("mm_token_type_ids", None)
+            mm_inputs_per_sample.append(mm)
+        else:
+            mm_inputs_per_sample.append(None)
+
+    def _extract_unpadded_prompt_position_ids(
+        self,
+        i: int,
+        prompt_ids: torch.Tensor,
+        student_position_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if student_position_ids is None:
+            return None
+        prompt_width = prompt_ids.shape[1]
+        mask = prompt_ids[i] != self.pad_token_id
+        if student_position_ids.dim() == 3:
+            pos = student_position_ids[i, :, :prompt_width]
+            return pos[:, mask].long()
+        if student_position_ids.dim() == 2:
+            pos = student_position_ids[i, :prompt_width]
+            return pos[mask].long()
+        return None
 
     # --------------------------------------------------------------- private
 
@@ -298,12 +365,16 @@ class SelfDistillationRuntime:
             text = self.processor.apply_chat_template(
                 sample.messages, tokenize=False, add_generation_prompt=True
             )
-            mm_inputs = self.processor(
+            mm_inputs = build_multimodal_processor_inputs(
+                self.processor,
                 text=[text],
                 images=sample.multi_modal_data.get("images"),
                 videos=sample.multi_modal_data.get("videos"),
-                return_tensors="pt",
-                add_special_tokens=False,
+                audio=sample.multi_modal_data.get("audios"),
+                mm_processor_kwargs={
+                    **self.mm_processor_kwargs,
+                    "add_special_tokens": False,
+                },
             )
             ids = mm_inputs["input_ids"][0]
             attn = mm_inputs["attention_mask"][0]
@@ -325,7 +396,39 @@ class SelfDistillationRuntime:
         ids, attn = self._maybe_truncate(ids, attn)
         if pos is not None and pos.shape[-1] > ids.shape[0]:
             pos = pos[..., : ids.shape[0]] if self.truncation != "left" else pos[..., -ids.shape[0] :]
+        if mm_inputs_out is not None and not self._has_valid_mm_token_alignment(ids, mm_inputs_out):
+            raise ValueError(
+                "teacher multimodal prompt was truncated across image/video tokens; "
+                "falling back to the student prompt and masking distillation for this sample"
+            )
         return ids.long(), attn.long(), mm_inputs_out, pos
+
+    def _has_valid_mm_token_alignment(self, input_ids: torch.Tensor, mm_inputs: dict) -> bool:
+        if self.processor is None:
+            return True
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        video_token_id = getattr(self.processor, "video_token_id", None)
+        image_grid_thw = mm_inputs.get("image_grid_thw")
+        video_grid_thw = mm_inputs.get("video_grid_thw")
+
+        if image_token_id is not None and image_grid_thw is not None:
+            expected = self._grid_feature_count(image_grid_thw)
+            actual = int((input_ids == int(image_token_id)).sum().item())
+            if actual != expected:
+                return False
+        if video_token_id is not None and video_grid_thw is not None:
+            expected = self._grid_feature_count(video_grid_thw)
+            actual = int((input_ids == int(video_token_id)).sum().item())
+            if actual != expected:
+                return False
+        return True
+
+    def _grid_feature_count(self, grid_thw: torch.Tensor) -> int:
+        image_processor = getattr(self.processor, "image_processor", None)
+        merge_size = getattr(image_processor, "merge_size", None)
+        if merge_size is None:
+            merge_size = getattr(image_processor, "spatial_merge_size", 2)
+        return int((grid_thw.long().prod(dim=-1) // (int(merge_size) ** 2)).sum().item())
 
     def _compute_prompt_position_ids(
         self,
